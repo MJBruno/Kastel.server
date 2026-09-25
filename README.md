@@ -1,8 +1,7 @@
-# Kastel LSP
+# KASTEL LSP
 
 Language Server Protocol implementation for the current Kastel language.
-It is designed for VS Code clients and follows the same interaction model users
-expect from TypeScript: completion is context-aware, symbols are resolved from
+It is designed for VS Code clients and follows the same interaction model users: completion is context-aware, symbols are resolved from
 the workspace, signatures and hover information are derived from the language
 type model, and edits remain useful while the source is incomplete during typing.
 
@@ -50,7 +49,7 @@ editor.
 From the Kastel repository root:
 
 ```text
-cargo build --manifest-path LSP/Cargo.toml --release
+cargo build --release
 ```
 
 The executable is produced by Cargo under `LSP/target/release/kastel-lsp`.
