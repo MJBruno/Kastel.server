@@ -76,6 +76,9 @@ pub fn analyze(workspace: &Workspace, uri: &str) -> Vec<Diagnostic> {
     collect_local_declarations(&tokens, &brace_scopes, &mut scopes);
 
     collect_function_parameter_bindings(&masked, &tokens, &scopes, &mut bindings);
+    collect_fat_arrow_bindings(&masked, &mut bindings);
+    collect_generic_bindings(&masked, &tokens, &mut bindings);
+    collect_enum_variant_bindings(&masked, &tokens, &mut bindings);
 
     let identifiers = scan_identifiers(&masked);
     let mut diagnostics = Vec::new();
@@ -224,7 +227,7 @@ fn is_declaration_name(source: &str, offset: usize) -> bool {
     }
     matches!(
         previous,
-        Some("func" | "class" | "interface" | "type" | "let" | "const")
+        Some("func" | "class" | "interface" | "enum" | "type" | "let" | "const")
     )
 }
 
@@ -347,7 +350,19 @@ fn collect_local_declarations(
     }
 }
 
+fn is_punctuation(tokens: &[LexToken], index: usize, punctuation: u8) -> bool {
+    matches!(
+        tokens.get(index).map(|token| &token.kind),
+        Some(LexTokenKind::Punctuation(value)) if *value == punctuation
+    )
+}
+
 fn collect_function_name(tokens: &[LexToken], func_index: usize, scopes: &mut [Scope]) {
+    // `func(a, b) { ... }` : fonction anonyme, elle ne déclare aucun nom.
+    if is_punctuation(tokens, func_index + 1, b'(') {
+        return;
+    }
+
     let Some(name_index) = next_identifier_index(tokens, func_index + 1) else {
         return;
     };
@@ -377,14 +392,22 @@ fn collect_function_parameter_bindings(
             continue;
         }
 
-        let Some(name_index) = next_identifier_index(tokens, index + 1) else {
-            index += 1;
-            continue;
-        };
+        // `func nom(...)` ou fonction anonyme `func(...)`.
+        let open_paren_index = if is_punctuation(tokens, index + 1, b'(') {
+            index + 1
+        } else {
+            let Some(name_index) = next_identifier_index(tokens, index + 1) else {
+                index += 1;
+                continue;
+            };
 
-        let Some(open_paren_index) = next_punctuation_index(tokens, name_index + 1, b'(') else {
-            index = name_index + 1;
-            continue;
+            let Some(open_paren_index) = next_punctuation_index(tokens, name_index + 1, b'(')
+            else {
+                index = name_index + 1;
+                continue;
+            };
+
+            open_paren_index
         };
 
         let open_paren = tokens[open_paren_index].start;
@@ -415,6 +438,352 @@ fn collect_function_parameter_bindings(
 
         index = open_paren_index + 1;
     }
+}
+
+/// Bindings introduits par `=>` :
+///
+/// - paramètres de fonctions fléchées : `x => x * 2`, `(a, b) => a + b` ;
+/// - variables des patterns de `match` : `n =>`, `Some(v) =>`,
+///   `Ok(v) if v > 0 =>`, `Err(e) =>`, `[a, b] =>`, `(x, y) =>`.
+///
+/// La portée va du début du pattern/des paramètres jusqu'à la fin du corps
+/// (bloc `{ ... }` ou expression). Cette approximation est volontairement
+/// large : elle peut manquer un diagnostic, jamais en fabriquer un.
+fn collect_fat_arrow_bindings(source: &str, bindings: &mut Vec<Binding>) {
+    let bytes = source.as_bytes();
+    let mut index = 0usize;
+
+    while index + 1 < bytes.len() {
+        if bytes[index] != b'=' || bytes[index + 1] != b'>' {
+            index += 1;
+            continue;
+        }
+
+        let arrow = index;
+        let segment_start = arrow_segment_start(bytes, arrow);
+        let body_end = arrow_body_end(source, arrow + 2);
+
+        for parameter in pattern_binding_names(source, segment_start, arrow) {
+            bindings.push(Binding {
+                name: parameter.name,
+                start: parameter.start,
+                end: body_end,
+            });
+        }
+
+        index += 2;
+    }
+}
+
+/// Début du pattern ou de la liste de paramètres qui précède un `=>`.
+fn arrow_segment_start(bytes: &[u8], arrow: usize) -> usize {
+    let mut depth = 0usize;
+    let mut index = arrow;
+
+    while index > 0 {
+        match bytes[index - 1] {
+            b')' | b']' => depth += 1,
+            b'(' | b'[' => {
+                if depth == 0 {
+                    return index;
+                }
+                depth -= 1;
+            }
+            b'{' | b'}' | b';' => return index,
+            b',' | b'\n' if depth == 0 => return index,
+            b'=' if depth == 0 && is_plain_assignment(bytes, index - 1) => return index,
+            _ => {}
+        }
+        index -= 1;
+    }
+
+    0
+}
+
+/// `=` seul : ni `==`, `!=`, `<=`, `>=` ni le début de `=>`.
+fn is_plain_assignment(bytes: &[u8], index: usize) -> bool {
+    let previous = index.checked_sub(1).map(|i| bytes[i]);
+    let next = bytes.get(index + 1).copied();
+
+    !matches!(previous, Some(b'=' | b'!' | b'<' | b'>')) && !matches!(next, Some(b'=' | b'>'))
+}
+
+/// Fin du corps qui suit un `=>`.
+fn arrow_body_end(source: &str, from: usize) -> usize {
+    let bytes = source.as_bytes();
+    let mut index = from;
+
+    while index < bytes.len() && bytes[index].is_ascii_whitespace() {
+        index += 1;
+    }
+
+    if index < bytes.len() && bytes[index] == b'{' {
+        return find_matching_char(source, index, b'{', b'}')
+            .map(|end| end + 1)
+            .unwrap_or(bytes.len());
+    }
+
+    let mut depth = 0usize;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'(' | b'[' | b'{' => depth += 1,
+            b')' | b']' | b'}' => {
+                if depth == 0 {
+                    return index;
+                }
+                depth -= 1;
+            }
+            b',' | b';' if depth == 0 => return index,
+            _ => {}
+        }
+        index += 1;
+    }
+
+    bytes.len()
+}
+
+/// Identifiants liés par un pattern / une liste de paramètres.
+///
+/// Sont ignorés : `_`, les mots-clés, les membres (`Color.Red`), les noms
+/// d'enum ou de constructeurs suivis de `.` / `(` (`Some(`, `Ok(`, `Err(`) et
+/// tout ce qui suit une garde `if`.
+fn pattern_binding_names(source: &str, start: usize, end: usize) -> Vec<Parameter> {
+    let bytes = source.as_bytes();
+    let mut names = Vec::new();
+    let mut index = start;
+
+    while index < end {
+        if !is_identifier_start(bytes[index]) {
+            index += 1;
+            continue;
+        }
+
+        let name_start = index;
+        index += 1;
+        while index < end && is_identifier_byte(bytes[index]) {
+            index += 1;
+        }
+        let name = &source[name_start..index];
+
+        // Garde : `Some(v) if v > 0 =>` — ce qui suit `if` n'est plus un pattern.
+        if name == "if" {
+            break;
+        }
+
+        let before = source[start..name_start].trim_end();
+        let after = source[index..end].trim_start();
+
+        if name == "_"
+            || KEYWORDS.contains(&name)
+            || before.ends_with('.')
+            || after.starts_with('.')
+            || after.starts_with('(')
+        {
+            continue;
+        }
+
+        names.push(Parameter {
+            name: name.to_string(),
+            start: name_start,
+        });
+    }
+
+    names
+}
+
+/// Paramètres génériques : `func f<T>(...)`, `class Boite<T: Eq>`,
+/// `interface Source<T>`, `enum Option2<T>`, `type Paire<A, B> = ...`.
+///
+/// `T` est visible de `<` jusqu'à la fin de la déclaration (corps compris).
+fn collect_generic_bindings(source: &str, tokens: &[LexToken], bindings: &mut Vec<Binding>) {
+    let bytes = source.as_bytes();
+
+    for index in 0..tokens.len() {
+        let Some(keyword) = token_identifier(tokens, index) else {
+            continue;
+        };
+
+        if !matches!(keyword, "func" | "class" | "interface" | "enum" | "type") {
+            continue;
+        }
+
+        let Some(name) = tokens.get(index + 1).and_then(|token| match &token.kind {
+            LexTokenKind::Identifier(name) => Some((name.as_str(), token.start)),
+            LexTokenKind::Punctuation(_) => None,
+        }) else {
+            continue;
+        };
+
+        let mut open = name.1 + name.0.len();
+        while open < bytes.len() && bytes[open].is_ascii_whitespace() {
+            open += 1;
+        }
+        if open >= bytes.len() || bytes[open] != b'<' {
+            continue;
+        }
+
+        let Some(close) = find_generic_close(bytes, open) else {
+            continue;
+        };
+
+        let end = generic_scope_end(source, keyword, close);
+
+        for parameter in generic_parameter_names(source, open + 1, close) {
+            bindings.push(Binding {
+                name: parameter.name,
+                start: open,
+                end,
+            });
+        }
+    }
+}
+
+/// Variants d'enum : `enum Couleur { Rouge, Vert, func nom() { ... } }`.
+///
+/// Les variants sont des déclarations (jamais des références) ; ils précèdent
+/// les éventuelles méthodes, ce qui permet de s'arrêter au premier `func`.
+fn collect_enum_variant_bindings(source: &str, tokens: &[LexToken], bindings: &mut Vec<Binding>) {
+    let bytes = source.as_bytes();
+
+    for index in 0..tokens.len() {
+        if token_identifier(tokens, index) != Some("enum") {
+            continue;
+        }
+
+        let Some(name_token) = tokens.get(index + 1) else {
+            continue;
+        };
+        let name_end = match &name_token.kind {
+            LexTokenKind::Identifier(name) => name_token.start + name.len(),
+            LexTokenKind::Punctuation(_) => continue,
+        };
+
+        let Some(open) = find_next_open_brace(source, name_end) else {
+            continue;
+        };
+        let Some(close) = find_matching_char(source, open, b'{', b'}') else {
+            continue;
+        };
+
+        let mut position = open + 1;
+        let mut depth = 0usize;
+        let mut expecting_variant = true;
+
+        while position < close {
+            let byte = bytes[position];
+
+            if is_identifier_start(byte) {
+                let start = position;
+                position += 1;
+                while position < close && is_identifier_byte(bytes[position]) {
+                    position += 1;
+                }
+                let name = &source[start..position];
+
+                if name == "func" {
+                    break;
+                }
+                if depth == 0 && expecting_variant {
+                    bindings.push(Binding {
+                        name: name.to_string(),
+                        start,
+                        end: close,
+                    });
+                    expecting_variant = false;
+                }
+                continue;
+            }
+
+            match byte {
+                b'(' | b'[' | b'{' => depth += 1,
+                b')' | b']' | b'}' => depth = depth.saturating_sub(1),
+                b',' if depth == 0 => expecting_variant = true,
+                _ => {}
+            }
+            position += 1;
+        }
+    }
+}
+
+/// `>` qui referme la liste ouverte en `open`, ou `None` si ce n'est pas une
+/// liste de paramètres génériques (parenthèse, accolade ou `;` rencontrés).
+fn find_generic_close(bytes: &[u8], open: usize) -> Option<usize> {
+    let mut depth = 0usize;
+
+    for (offset, byte) in bytes[open..].iter().enumerate() {
+        match byte {
+            b'<' => depth += 1,
+            b'>' => {
+                depth = depth.saturating_sub(1);
+                if depth == 0 {
+                    return Some(open + offset);
+                }
+            }
+            b'(' | b')' | b'{' | b'}' | b';' => return None,
+            _ => {}
+        }
+    }
+
+    None
+}
+
+fn generic_scope_end(source: &str, keyword: &str, close: usize) -> usize {
+    let bytes = source.as_bytes();
+
+    if keyword == "type" {
+        return bytes[close..]
+            .iter()
+            .position(|byte| *byte == b';' || *byte == b'\n')
+            .map(|relative| close + relative + 1)
+            .unwrap_or(bytes.len());
+    }
+
+    // Corps `{ ... }`, ou déclaration sans corps terminée par `;`
+    // (méthode d'interface).
+    let Some(relative) = bytes[close..]
+        .iter()
+        .position(|byte| *byte == b'{' || *byte == b';')
+    else {
+        return bytes.len();
+    };
+    let position = close + relative;
+
+    if bytes[position] == b'{' {
+        find_matching_char(source, position, b'{', b'}')
+            .map(|end| end + 1)
+            .unwrap_or(bytes.len())
+    } else {
+        position + 1
+    }
+}
+
+/// Noms des paramètres génériques : premier identifiant de chaque segment
+/// séparé par une virgule de niveau 0 (`T: Add + Eq, U` -> `T`, `U`).
+fn generic_parameter_names(source: &str, start: usize, end: usize) -> Vec<Parameter> {
+    let bytes = source.as_bytes();
+    let mut result = Vec::new();
+    let mut segment_start = start;
+    let mut depth = 0usize;
+
+    for index in start..end {
+        match bytes[index] {
+            b'<' | b'(' | b'[' => depth += 1,
+            b'>' | b')' | b']' => depth = depth.saturating_sub(1),
+            b',' if depth == 0 => {
+                if let Some(parameter) = first_parameter_in_range(source, segment_start, index) {
+                    result.push(parameter);
+                }
+                segment_start = index + 1;
+            }
+            _ => {}
+        }
+    }
+
+    if let Some(parameter) = first_parameter_in_range(source, segment_start, end) {
+        result.push(parameter);
+    }
+
+    result
 }
 
 fn scopes_index_for_brace(scopes: &[Scope], brace_offset: usize) -> Option<usize> {
@@ -784,7 +1153,7 @@ println(values.size)
 
 func addSeconds(value) {
     let result = new DateTime();
-    result.value = this.value + value;
+    result.value = self.value + value;
     return result;
 }
 "#;
@@ -850,11 +1219,11 @@ println(hidden);
     #[test]
     fn detects_typo_between_declared_and_used_identifier() {
         let source = r#"func month() {
-    let days = int(this.value / 86400);
+    let days = int(self.value / 86400);
     let yer = 1970;
 
-    while days >= this.daysInYear(year) {
-        days = days - this.daysInYear(year);
+    while days >= self.daysInYear(year) {
+        days = days - self.daysInYear(year);
         year = year + 1;
     }
 
@@ -950,5 +1319,169 @@ println(hidden);
         assert_eq!(diagnostics.len(), 1);
         assert_eq!(diagnostics[0].line, 1);
         assert_eq!(diagnostics[0].column, 9);
+    }
+
+    fn assert_no_diagnostics(source: &str) {
+        let workspace = workspace_with(source);
+        let diagnostics = analyze(&workspace, "file:///main.ks");
+        assert!(
+            diagnostics.is_empty(),
+            "unexpected diagnostics: {:?}",
+            diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn allows_concurrency_and_result_builtins() {
+        assert_no_diagnostics(
+            r#"let ch = channel(4);
+let lock = mutex();
+let group = wait_group();
+let handle = spawn(work, 1);
+sleep(10);
+yield();
+let r = Ok(1);
+let o = Some(2);
+let e = Err("x");
+"#,
+        );
+    }
+
+    #[test]
+    fn allows_generic_parameters() {
+        assert_no_diagnostics(
+            r#"func premier<T>(valeurs: List<T>) -> T {
+    let resultat: T = valeurs.first();
+    return resultat;
+}
+
+class Boite<T> {
+    let contenu: T;
+    func lire() -> T {
+        return self.contenu;
+    }
+    func convertir<U>(f) -> U {
+        return f(self.contenu);
+    }
+}
+
+interface Source<T> {
+    func suivant() -> T;
+}
+
+type Paire<A, B> = Tuple<A, B>;
+"#,
+        );
+    }
+
+    #[test]
+    fn detects_generic_parameter_used_outside_its_scope() {
+        let workspace = workspace_with(
+            r#"func premier<T>(valeur: T) -> T {
+    return valeur;
+}
+let x: T = 1;
+"#,
+        );
+        let diagnostics = analyze(&workspace, "file:///main.ks");
+
+        assert_eq!(diagnostics.len(), 1, "{:?}", diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>());
+        assert!(diagnostics[0].message.contains('T'));
+        assert_eq!(diagnostics[0].line, 4);
+    }
+
+    #[test]
+    fn allows_arrow_function_parameters() {
+        assert_no_diagnostics(
+            r#"let doubles = [1, 2, 3].map(x => x * 2);
+let somme = [1, 2, 3].reduce(0, (acc, x) => acc + x);
+let f = (a, b) => {
+    let total = a + b;
+    return total;
+};
+"#,
+        );
+    }
+
+    #[test]
+    fn allows_anonymous_func_parameters() {
+        assert_no_diagnostics(
+            r#"let addition = func(a, b) {
+    return a + b;
+};
+println(addition(1, 2));
+"#,
+        );
+    }
+
+    #[test]
+    fn allows_match_pattern_bindings() {
+        assert_no_diagnostics(
+            r#"func decrire(valeur) {
+    match valeur {
+        Some(v) if v > 0 => println(v),
+        Some(v) => println(v),
+        Ok(resultat) => println(resultat),
+        Err(erreur) => println(erreur),
+        [premier, second] => println(premier + second),
+        n => println(n),
+    }
+}
+"#,
+        );
+    }
+
+    #[test]
+    fn detects_undefined_identifier_in_match_arm_body() {
+        let workspace = workspace_with(
+            r#"func decrire(valeur) {
+    match valeur {
+        Some(v) => println(inconnu),
+        _ => println(0),
+    }
+}
+"#,
+        );
+        let diagnostics = analyze(&workspace, "file:///main.ks");
+
+        assert_eq!(diagnostics.len(), 1, "{:?}", diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>());
+        assert!(diagnostics[0].message.contains("inconnu"));
+    }
+
+    #[test]
+    fn match_binding_does_not_leak_after_the_arm() {
+        let workspace = workspace_with(
+            r#"func decrire(valeur) {
+    match valeur {
+        Some(v) => println(v),
+        _ => println(0),
+    }
+    println(v);
+}
+"#,
+        );
+        let diagnostics = analyze(&workspace, "file:///main.ks");
+
+        assert_eq!(diagnostics.len(), 1, "{:?}", diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>());
+        assert_eq!(diagnostics[0].line, 6);
+    }
+
+    #[test]
+    fn allows_enum_declaration_and_variant_pattern() {
+        assert_no_diagnostics(
+            r#"enum Couleur {
+    Rouge,
+    Vert,
+}
+
+func nom(c) {
+    match c {
+        Couleur.Rouge => return "rouge",
+        Couleur.Vert => return "vert",
+        _ => return "?",
+    }
+}
+"#,
+        );
     }
 }

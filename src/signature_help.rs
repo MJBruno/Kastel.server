@@ -7,8 +7,7 @@ use serde_json::{Value, json};
 use crate::class_index::MethodInfo;
 use crate::completion::{infer_receiver_types, line_and_byte_to_offset, line_text_at};
 use crate::language::{
-    BUILTIN_FUNCTIONS, DICT_METHODS, LIST_METHODS, RANGE_METHODS, SET_METHODS, STRING_METHODS,
-    TUPLE_METHODS,
+    BUILTIN_FUNCTIONS, member_table,
 };
 use crate::workspace::{Workspace, WorkspaceDocument};
 
@@ -167,20 +166,19 @@ fn member_signature_candidates(
             .flat_map(|m| member_signature_candidates(workspace, uri, document, m, member))
             .collect(),
         Type::Module(path) => module_signature_candidates(workspace, uri, path, member),
-        Type::Named(class_name) => document
+        Type::Named(class_name)
+        | Type::Generic {
+            name: class_name, ..
+        } if document.classes.contains(class_name) => document
             .classes
             .all_methods(class_name)
             .iter()
             .filter(|method| method.name == member)
             .map(|method| method_candidate(method))
             .collect(),
-        Type::Str => table_signature(STRING_METHODS, member),
-        Type::Array(_) | Type::ArrayDynamic => table_signature(LIST_METHODS, member),
-        Type::Dict(_, _) | Type::DictDynamic => table_signature(DICT_METHODS, member),
-        Type::Tuple(_) | Type::TupleDynamic => table_signature(TUPLE_METHODS, member),
-        Type::Set(_) | Type::SetDynamic => table_signature(SET_METHODS, member),
-        Type::Range => table_signature(RANGE_METHODS, member),
-        _ => Vec::new(),
+        other => member_table(other)
+            .map(|table| table_signature(table, member))
+            .unwrap_or_default(),
     }
 }
 

@@ -8,7 +8,7 @@ use crate::completion::{detect_member_access, infer_receiver_types, line_and_byt
 use crate::lsp_position::offset_to_lsp;
 use crate::module_resolver::ModuleResolver;
 use crate::text_util::{find_word_at, utf16_character_to_byte_index};
-use crate::uri_util::{path_to_uri, uri_to_path};
+use crate::uri_util::{path_to_uri, same_uri, uri_to_path};
 use crate::workspace::{Workspace, WorkspaceDocument};
 
 fn location(uri: &str, document: &WorkspaceDocument, start: usize, end: usize) -> Value {
@@ -43,7 +43,7 @@ pub fn build_definition(
     let word = find_word_at(&document.text, line_index, char_index)?;
     let absolute = line_and_byte_to_offset(&document.text, line_index, byte_index);
 
-    // 1. Accès membre : `obj.method`, `obj.field`, `this.method`,
+    // 1. Accès membre : `obj.method`, `obj.field`, `self.method`,
     //    `module.export`.
     if let Some(context) = detect_member_access(line_text, byte_index) {
         if let Some(result) =
@@ -98,7 +98,7 @@ fn resolve_member_definition(
         }
     }
 
-    if receiver == "this" {
+    if receiver == "self" {
         if let Some(class_name) = find_enclosing_class(document, offset) {
             return class_member_definition(document, uri, &class_name, member);
         }
@@ -203,6 +203,17 @@ fn find_member_declaration_span(
         }
     }
 
+    // `enum Color { Red, Green, Blue }` : un variant n'a ni `func` ni `let`
+    // devant lui, juste son nom nu dans le corps de l'enum.
+    let mut search_from = 0;
+    while let Some(relative) = region[search_from..].find(member) {
+        let start = class_span.0 + search_from + relative;
+        if is_identifier_at(&masked, start, member) {
+            return Some((start, start + member.len()));
+        }
+        search_from += relative + 1;
+    }
+
     None
 }
 
@@ -232,7 +243,7 @@ fn module_member_definition(
     if !module
         .symbols
         .get(member)
-        .map(|symbol| symbol.is_exported || module_uri == current_uri)
+        .map(|symbol| symbol.is_exported || same_uri(&module_uri, current_uri))
         .unwrap_or(false)
     {
         return None;
@@ -379,7 +390,7 @@ fn resolve_import_resolution(
             let module_uri = path_to_uri(&path);
             let module = workspace.get(&module_uri)?;
             let symbol = module.symbols.get(name)?;
-            if !symbol.is_exported && module_uri != current_uri {
+            if !symbol.is_exported && !same_uri(&module_uri, current_uri) {
                 return None;
             }
             symbol_location(&module_uri, module, name)
@@ -391,7 +402,7 @@ fn resolve_import_resolution(
             let module_uri = path_to_uri(&module);
             let module_doc = workspace.get(&module_uri)?;
             let symbol = module_doc.symbols.get(&export_name)?;
-            if !symbol.is_exported && module_uri != current_uri {
+            if !symbol.is_exported && !same_uri(&module_uri, current_uri) {
                 return None;
             }
             symbol_location(&module_uri, module_doc, &export_name)
@@ -415,7 +426,11 @@ fn find_type_span(source: &str, name: &str) -> Option<(usize, usize)> {
     let masked = crate::text_util::mask_strings_and_comments(source);
     let mut best = None;
 
-    for kind in ["class", "interface"] {
+    // `enum` est inclus : ses méthodes acceptent `self` (elles sont
+    // vérifiées via `check_class`, comme les classes — voir
+    // `type_checker::Statement::Enum`), et ses variants sont résolus comme
+    // des membres qualifiés (`Color.Red`).
+    for kind in ["class", "interface", "enum"] {
         let needle = format!("{} {}", kind, name);
         if let Some(start) = masked.find(&needle) {
             let brace = masked[start..].find('{')? + start;

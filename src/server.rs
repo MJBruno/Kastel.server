@@ -140,14 +140,10 @@ impl Server {
 
             _ => {
                 if let Some(id) = request.id {
-                    messages.push(ServerMessage::Response(RpcResponse::new(
+                    messages.push(ServerMessage::Response(RpcResponse::error(
                         id,
-                        json!({
-                            "error": format!(
-                                "Unknown LSP method: {}",
-                                request.method
-                            )
-                        }),
+                        -32601,
+                        format!("Unknown LSP method: {}", request.method),
                     )));
                 }
             }
@@ -405,6 +401,7 @@ impl Server {
                             crate::symbols::SymbolKind::Function => 12,
                             crate::symbols::SymbolKind::Class => 5,
                             crate::symbols::SymbolKind::Interface => 11,
+                            crate::symbols::SymbolKind::Enum => 10,
                             crate::symbols::SymbolKind::Import => 2,
                             crate::symbols::SymbolKind::TypeAlias => 26,
                         };
@@ -696,6 +693,7 @@ impl Server {
                         crate::symbols::SymbolKind::Function => 12,
                         crate::symbols::SymbolKind::Class => 5,
                         crate::symbols::SymbolKind::Interface => 11,
+                        crate::symbols::SymbolKind::Enum => 10,
                         crate::symbols::SymbolKind::Import => 2,
                         crate::symbols::SymbolKind::TypeAlias => 26,
                     },

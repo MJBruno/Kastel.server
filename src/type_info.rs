@@ -13,22 +13,36 @@ pub struct TypeInfo {
 #[derive(Debug, Clone)]
 pub struct FunctionSignature {
     pub name: String,
+    /// Noms des paramètres génériques : `func premier<T>(...)` -> `["T"]`.
+    pub generic_params: Vec<String>,
     pub params: Vec<(String, Type)>,
     pub return_type: Type,
+    /// `async func ...` (champ requis par `FunctionType` du crate kastel).
+    pub is_async: bool,
 }
 
 impl FunctionSignature {
     pub fn function_type(&self) -> FunctionType {
         FunctionType {
+            generic_params: self.generic_params.clone(),
+            generic_constraints: Vec::new(),
             params: self.params.iter().map(|(_, ty)| ty.clone()).collect(),
             return_type: Box::new(self.return_type.clone()),
+            is_async: self.is_async,
         }
     }
 
     pub fn label(&self) -> String {
+        let generics = if self.generic_params.is_empty() {
+            String::new()
+        } else {
+            format!("<{}>", self.generic_params.join(", "))
+        };
+
         format!(
-            "func {}({}) -> {}",
+            "func {}{}({}) -> {}",
             self.name,
+            generics,
             self.params
                 .iter()
                 .map(|(name, ty)| format!("{}: {}", name, ty))
@@ -69,7 +83,15 @@ impl TypeInfo {
         if let Some(method) = receiver.set_member_type(name) {
             return Some(method);
         }
-        None
+        // Types génériques et handles du runtime. Chaque helper renvoie `None`
+        // pour un receveur d'un autre genre ; l'ordre est donc indifférent.
+        receiver
+            .option_result_member_type(name)
+            .or_else(|| receiver.task_member_type(name))
+            .or_else(|| receiver.channel_member_type(name))
+            .or_else(|| receiver.mutex_member_type(name))
+            .or_else(|| receiver.semaphore_member_type(name))
+            .or_else(|| receiver.wait_group_member_type(name))
     }
 }
 
@@ -96,10 +118,12 @@ fn collect_statements(
             }
             Statement::Function {
                 name,
+                generic_params,
                 params,
                 param_types,
                 return_type,
                 body,
+                is_async,
             } => {
                 let params_with_types = params
                     .iter()
@@ -121,8 +145,13 @@ fn collect_statements(
 
                 let signature = FunctionSignature {
                     name: name.clone(),
+                    generic_params: generic_params
+                        .iter()
+                        .map(|param| param.name.clone())
+                        .collect(),
                     params: params_with_types,
                     return_type: inferred_return,
+                    is_async: is_async.clone(),
                 };
 
                 info.symbols.insert(
@@ -146,10 +175,14 @@ fn collect_statements(
                 collect_statements(body, info, scopes);
                 scopes.pop();
             }
-            Statement::Class { name, .. } | Statement::Interface { name, .. } => {
+            Statement::Class { name, .. }
+            | Statement::Interface { name, .. }
+            | Statement::Enum { name, .. } => {
                 info.symbols.insert(name.clone(), Type::Named(name.clone()));
             }
-            Statement::TypeAlias { name, type_expr } => {
+            Statement::TypeAlias {
+                name, type_expr, ..
+            } => {
                 let ty = resolve_type_expr(info, type_expr);
                 info.aliases.insert(name.clone(), ty.clone());
                 info.symbols.insert(name.clone(), ty);
@@ -218,6 +251,7 @@ fn collect_statements(
                 catch_name,
                 catch_body,
                 finally_body,
+                ..
             } => {
                 scopes.push(HashMap::new());
                 collect_statements(try_body, info, scopes);
@@ -316,8 +350,33 @@ fn infer_expression(info: &TypeInfo, expr: &Expression, env: &HashMap<String, Ty
             .cloned()
             .or_else(|| info.symbols.get(name).cloned())
             .unwrap_or(Type::Dynamic),
-        Expression::This | Expression::Base => Type::Dynamic,
-        Expression::New { class_name, .. } => Type::Named(class_name.clone()),
+        Expression::SelfValue => Type::Dynamic,
+        Expression::New {
+            class_name,
+            generic_args,
+            ..
+        } => {
+            if generic_args.is_empty() {
+                Type::Named(class_name.clone())
+            } else {
+                Type::Generic {
+                    name: class_name.clone(),
+                    arguments: generic_args
+                        .iter()
+                        .map(|arg| resolve_type_expr(info, arg))
+                        .collect(),
+                }
+            }
+        }
+        // Opérateur `?` : déballe `Option<T>` / `Result<T, E>` en `T`.
+        Expression::Try(inner) => match infer_expression(info, inner, env) {
+            Type::Generic { name, arguments }
+                if matches!(name.to_ascii_lowercase().as_str(), "option" | "result") =>
+            {
+                arguments.into_iter().next().unwrap_or(Type::Dynamic)
+            }
+            _ => Type::Dynamic,
+        },
         Expression::Array(items) => {
             let element = items
                 .iter()
@@ -393,24 +452,84 @@ fn infer_expression(info: &TypeInfo, expr: &Expression, env: &HashMap<String, Ty
             info.member_type(&object_ty, name).unwrap_or(Type::Dynamic)
         }
         Expression::Index { object, .. } => infer_expression(info, object, env).element_type(),
-        Expression::Call { callee, .. } => match infer_expression(info, callee, env) {
+        Expression::Call {
+            callee, arguments, ..
+        } => {
+            if let Some(ty) = infer_intrinsic_call(info, callee, arguments, env) {
+                return ty;
+            }
+            match infer_expression(info, callee, env) {
             Type::Function(function) => (*function.return_type).clone(),
             Type::Overloads(overloads) => overloads
                 .first()
                 .map(|f| (*f.return_type).clone())
                 .unwrap_or(Type::Dynamic),
             other => other,
-        },
+            }
+        }
         Expression::Function { params, .. } => Type::Function(FunctionType {
+            generic_params: Vec::new(),
+            generic_constraints: Vec::new(),
             params: vec![Type::Dynamic; params.len()],
             return_type: Box::new(Type::Dynamic),
+            is_async: false,
         }),
         Expression::Ternary {
             then_expr,
             else_expr,
             ..
         } => infer_expression(info, then_expr, env).merge(&infer_expression(info, else_expr, env)),
+        // `await f()` : la valeur attendue a le type de retour de la fonction async.
+        Expression::Await(inner) => infer_expression(info, inner, env),
     }
+}
+
+/// Types produits par les natives et intrinsèques du runtime (`Some`, `Ok`,
+/// `Err`, `spawn`, `channel`, `mutex`, `semaphore`, `wait_group`).
+///
+/// Un identifiant redéfini par l'utilisateur (variable ou fonction du même
+/// nom) reprend la priorité : on ne déduit rien dans ce cas.
+fn infer_intrinsic_call(
+    info: &TypeInfo,
+    callee: &Expression,
+    arguments: &[Expression],
+    env: &HashMap<String, Type>,
+) -> Option<Type> {
+    let Expression::Variable(name) = callee else {
+        return None;
+    };
+    if env.contains_key(name) || info.symbols.contains_key(name) {
+        return None;
+    }
+
+    let generic = |name: &str, arguments: Vec<Type>| Type::Generic {
+        name: name.to_string(),
+        arguments,
+    };
+    let first = || {
+        arguments
+            .first()
+            .map(|arg| infer_expression(info, arg, env))
+            .unwrap_or(Type::Dynamic)
+    };
+
+    Some(match name.as_str() {
+        "Some" => generic("Option", vec![first()]),
+        "Ok" => generic("Result", vec![first(), Type::Dynamic]),
+        "Err" => generic("Result", vec![Type::Dynamic, first()]),
+        "spawn" => {
+            let result = match first() {
+                Type::Function(function) => (*function.return_type).clone(),
+                _ => Type::Dynamic,
+            };
+            generic("Task", vec![result])
+        }
+        "channel" => generic("Channel", vec![Type::Dynamic]),
+        "mutex" => Type::Named("Mutex".to_string()),
+        "semaphore" => Type::Named("Semaphore".to_string()),
+        "wait_group" => Type::Named("WaitGroup".to_string()),
+        _ => return None,
+    })
 }
 
 fn resolve_type_expr(info: &TypeInfo, expr: &TypeExpr) -> Type {

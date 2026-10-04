@@ -7,7 +7,7 @@
 //! 2. normalisation légère des espaces autour des opérateurs et séparateurs.
 //!
 //! Le style produit vise un code Kastel compact mais aéré :
-//! - `this.nom = nom;`
+//! - `self.nom = nom;`
 //! - `2 * 3`
 //! - `(5, 5)`
 //! - `let x: str = "hello";`
@@ -720,7 +720,7 @@ mod tests {
     #[test]
     fn normalizes_common_kastel_spacing() {
         let source = r#"func demo(){
-this.nom=nom;
+self.nom=nom;
 let x:            str="hello";
 let y=2*3;
 let point=(5,5);
@@ -730,7 +730,7 @@ let point=(5,5);
         let formatted = format_source(source, 4, true);
 
         let expected = r#"func demo() {
-    this.nom = nom;
+    self.nom = nom;
     let x: str = "hello";
     let y = 2 * 3;
     let point = (5, 5);

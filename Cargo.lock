@@ -11,7 +11,6 @@ checksum = "8f42a60cbdf9a97f5d2305f08a87dc4e09308d1276d28c869c684d7777685682"
 [[package]]
 name = "kastel"
 version = "0.1.0"
-source = "git+https://github.com/MJBruno/Kastel.git#2938d80808b8c64ce0a8c97e5b0a42d98724b25f"
 
 [[package]]
 name = "kastel-lsp"

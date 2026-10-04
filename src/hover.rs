@@ -4,8 +4,7 @@ use serde_json::{Value, json};
 use crate::class_index::MethodInfo;
 use crate::completion::{detect_member_access, line_and_byte_to_offset, line_text_at};
 use crate::language::{
-    BUILTIN_FUNCTIONS, DICT_METHODS, LIST_METHODS, RANGE_METHODS, SET_METHODS, STRING_METHODS,
-    TUPLE_METHODS,
+    BUILTIN_FUNCTIONS, member_table,
 };
 use crate::lsp_position::offset_to_lsp;
 use crate::symbols::SymbolKind;
@@ -20,7 +19,7 @@ pub fn build_hover(workspace: &Workspace, uri: &str, line: u32, character: u32) 
     let word_start = find_word_start(line_text, byte_index);
     let range = word_range(document, line as usize, word_start, word_start + word.len());
 
-    // Membre : `obj.method`, `obj.field`, `this.field`, `base.method`.
+    // Membre : `obj.method`, `obj.field`, `self.field`.
     if let Some(context) = detect_member_access(line_text, byte_index.max(word_start)) {
         if let Some(value) = build_member_hover(
             workspace,
@@ -93,11 +92,11 @@ fn build_local_symbol_hover(
                     .unwrap_or_else(|| format!("func {}(...)", word))
             }
         }
-        SymbolKind::Class | SymbolKind::Interface => {
-            let kind = if symbol.kind == SymbolKind::Class {
-                "class"
-            } else {
-                "interface"
+        SymbolKind::Class | SymbolKind::Interface | SymbolKind::Enum => {
+            let kind = match symbol.kind {
+                SymbolKind::Class => "class",
+                SymbolKind::Interface => "interface",
+                _ => "enum",
             };
             if let Some(info) = document.classes.get(word) {
                 let bases = if info.bases.is_empty() {
@@ -123,11 +122,16 @@ fn build_local_symbol_hover(
         }
     };
 
-    if matches!(symbol.kind, SymbolKind::Class | SymbolKind::Interface) {
+    if matches!(
+        symbol.kind,
+        SymbolKind::Class | SymbolKind::Interface | SymbolKind::Enum
+    ) {
         if let Some(info) = document.classes.get(word) {
             if !info.fields.is_empty() {
+                let label = if info.is_enum { "Variants" } else { "Fields" };
                 contents.push_str(&format!(
-                    "\n\n**Fields**\n{}",
+                    "\n\n**{}**\n{}",
+                    label,
                     info.fields
                         .iter()
                         .map(|name| format!("- `{}`", name))
@@ -225,21 +229,13 @@ fn infer_receiver_types(
     receiver: &str,
     offset: usize,
 ) -> Vec<Type> {
-    if receiver == "this" {
+    if receiver == "self" {
         return find_enclosing_class(document, offset)
             .map(|name| vec![Type::Named(name)])
             .unwrap_or_default();
     }
-    if receiver == "base" {
-        let Some(class_name) = find_enclosing_class(document, offset) else {
-            return Vec::new();
-        };
-        return document
-            .classes
-            .get(&class_name)
-            .map(|info| info.bases.iter().cloned().map(Type::Named).collect())
-            .unwrap_or_default();
-    }
+    // Pas de receveur `base`/`super` en Kastel : les classes n'héritent pas
+    // d'implémentation, seulement d'interfaces (contrats purs).
 
     let mut current = receiver
         .split('.')
@@ -299,8 +295,20 @@ fn hover_for_type_member(
                 Some(hover_value(hovers.join("\n\n---\n\n"), range.clone()))
             }
         }
-        Type::Named(class_name) => {
+        Type::Named(class_name)
+        | Type::Generic {
+            name: class_name, ..
+        } if document.classes.contains(class_name) => {
             if let Some(field) = document.classes.field(class_name, member) {
+                if document.classes.is_enum(class_name) {
+                    return Some(hover_value(
+                        format!(
+                            "```kastel\n{}.{}\n```\n\nVariant of enum `{}`",
+                            class_name, member, class_name
+                        ),
+                        range.clone(),
+                    ));
+                }
                 let ty = field
                     .type_annotation
                     .as_ref()
@@ -308,18 +316,21 @@ fn hover_for_type_member(
                     .unwrap_or_else(|| "dynamic".to_string());
                 return Some(hover_value(
                     format!(
-                        "```kastel\n{}: {}\n```\n\nField of `{}`",
-                        member, ty, class_name
+                        "```kastel\n{}{}: {}\n```\n\n{} of `{}`",
+                        if field.is_static { "static " } else { "" },
+                        member,
+                        ty,
+                        if field.is_static { "Static field" } else { "Field" },
+                        class_name
                     ),
                     range.clone(),
                 ));
             }
             if let Some(method) = document.classes.method(class_name, member) {
-                let visibility = if method.visibility == kastel::frontend::ast::Visibility::Private
-                {
-                    "private"
-                } else {
-                    "public"
+                let visibility = match method.visibility {
+                    kastel::frontend::ast::Visibility::Private => "private",
+                    kastel::frontend::ast::Visibility::Protected => "protected",
+                    kastel::frontend::ast::Visibility::Public => "public",
                 };
                 return Some(hover_value(
                     format!(
@@ -333,17 +344,14 @@ fn hover_for_type_member(
             }
             None
         }
-        Type::Array(_) | Type::ArrayDynamic => table_hover(LIST_METHODS, member, range),
-        Type::Dict(_, _) | Type::DictDynamic => table_hover(DICT_METHODS, member, range),
-        Type::Tuple(_) | Type::TupleDynamic => table_hover(TUPLE_METHODS, member, range),
-        Type::Set(_) | Type::SetDynamic => table_hover(SET_METHODS, member, range),
-        Type::Str => table_hover(STRING_METHODS, member, range),
-        Type::Range => table_hover(RANGE_METHODS, member, range),
         Type::Record(fields) => fields
             .iter()
             .find(|(name, _)| name == member)
             .map(|(_, ty)| {
                 hover_value(format!("```kastel\n{}: {}\n```", member, ty), range.clone())
+            })
+            .or_else(|| {
+                member_table(ty).and_then(|table| table_hover(table, member, range))
             }),
         Type::Module(path) => {
             let current_file = crate::uri_util::uri_to_path(current_uri)?;
@@ -359,7 +367,7 @@ fn hover_for_type_member(
             let module_uri = crate::uri_util::path_to_uri(&module_path);
             let module = workspace.get(&module_uri)?;
             let symbol = module.symbols.get(member)?;
-            if !symbol.is_exported && module_uri != current_uri {
+            if !symbol.is_exported && !crate::uri_util::same_uri(&module_uri, current_uri) {
                 return None;
             }
             let text = symbol
@@ -381,7 +389,9 @@ fn hover_for_type_member(
                 range.clone(),
             ))
         }
-        _ => None,
+        // Conteneurs, Option/Result, Task, Channel, Mutex, Semaphore,
+        // WaitGroup, Iterator : tables de `language.rs`.
+        other => member_table(other).and_then(|table| table_hover(table, member, range)),
     }
 }
 

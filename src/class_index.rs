@@ -2,12 +2,14 @@
 //!
 //! Contrairement à l'ancienne implémentation, l'index lit les champs déclarés
 //! (`let field: Type`) et leurs visibilités directement depuis l'AST. Il ne
-//! déduit donc plus un champ uniquement après avoir rencontré `this.field =`.
+//! déduit donc plus un champ uniquement après avoir rencontré `self.field =`.
 
 use std::collections::HashMap;
 
 use kastel::compiler::types::{FunctionType, Type};
-use kastel::frontend::ast::{AssignmentTarget, Expression, Statement, TypeExpr, Visibility};
+use kastel::frontend::ast::{
+    AssignmentTarget, Expression, GenericParam, Statement, TypeExpr, Visibility,
+};
 
 #[derive(Debug, Clone)]
 #[allow(unused)]
@@ -15,15 +17,22 @@ pub struct FieldInfo {
     pub name: String,
     pub type_annotation: Option<TypeExpr>,
     pub visibility: Visibility,
+    /// `static let compteur: int = 0;` : membre porté par la classe elle-même
+    /// (`NomClasse.compteur`), jamais par une instance. Les variants d'enum
+    /// sont aussi indexés comme des membres statiques.
+    pub is_static: bool,
 }
 
 #[derive(Debug, Clone)]
 pub struct MethodInfo {
     pub name: String,
+    pub generic_params: Vec<GenericParam>,
     pub params: Vec<String>,
     pub param_types: Vec<Option<TypeExpr>>,
     pub return_type: Option<TypeExpr>,
     pub visibility: Visibility,
+    /// `static func creer(...)` : appelée sur la classe, sans `self`.
+    pub is_static: bool,
 }
 
 impl MethodInfo {
@@ -52,11 +61,24 @@ impl MethodInfo {
             .map(|ty| format!(" -> {}", ty))
             .unwrap_or_default();
 
-        format!("func {}({}){}", self.name, params, return_type)
+        format!(
+            "{}func {}{}({}){}",
+            if self.is_static { "static " } else { "" },
+            self.name,
+            generic_params_display(&self.generic_params),
+            params,
+            return_type
+        )
     }
 
     pub fn function_type(&self) -> FunctionType {
         FunctionType {
+            generic_params: self
+                .generic_params
+                .iter()
+                .map(|param| param.name.clone())
+                .collect(),
+            generic_constraints: Vec::new(),
             params: self
                 .param_types
                 .iter()
@@ -73,6 +95,7 @@ impl MethodInfo {
                     .map(Type::from_type_expr)
                     .unwrap_or(Type::Dynamic),
             ),
+            is_async: false,
         }
     }
 }
@@ -85,6 +108,11 @@ pub struct ClassInfo {
     pub fields: Vec<String>,
     pub field_info: HashMap<String, FieldInfo>,
     pub is_interface: bool,
+    /// `enum Color { Red, Green, Blue }` : les variants sont indexés dans
+    /// `fields`/`field_info` (accès qualifié `Color.Red`, comme un membre
+    /// statique), et cet indicateur permet de les présenter différemment
+    /// (icône, documentation) sans dupliquer la logique de résolution.
+    pub is_enum: bool,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -111,6 +139,12 @@ impl ClassIndex {
 
     pub fn contains(&self, name: &str) -> bool {
         self.classes.contains_key(name)
+    }
+
+    /// `true` si `name` désigne un `enum` (les variants sont alors exposés
+    /// via `all_fields`/`field`, comme des membres statiques).
+    pub fn is_enum(&self, name: &str) -> bool {
+        self.classes.get(name).is_some_and(|info| info.is_enum)
     }
 
     pub fn names(&self) -> impl Iterator<Item = &String> {
@@ -302,7 +336,7 @@ impl ClassIndex {
             out.push(field.as_str());
         }
 
-        // Des champs écrits uniquement via `this.x = ...` restent visibles
+        // Des champs écrits uniquement via `self.x = ...` restent visibles
         // pour les anciennes classes dynamiques.
         for base in &info.bases {
             self.collect_fields(base, out, seen);
@@ -318,6 +352,7 @@ impl ClassIndex {
                 bases,
                 fields,
                 methods,
+                ..
             } => {
                 let mut field_info = HashMap::new();
                 let mut field_names = Vec::new();
@@ -330,12 +365,13 @@ impl ClassIndex {
                             name: field.name.clone(),
                             type_annotation: field.type_annotation.clone(),
                             visibility: field.visibility,
+                            is_static: field.is_static,
                         },
                     );
                 }
 
                 // Compatibilité avec le code qui avait des champs dynamiques
-                // initialisés par `this.name = ...` sans déclaration `let`.
+                // initialisés par `self.name = ...` sans déclaration `let`.
                 for method in methods {
                     collect_this_fields(&method.body, &mut field_names);
                 }
@@ -346,21 +382,24 @@ impl ClassIndex {
                 self.classes.insert(
                     name.clone(),
                     ClassInfo {
-                        bases: bases.clone(),
+                        bases: bases.iter().map(base_type_name).collect(),
                         methods: methods
                             .iter()
                             .filter(|method| !method.name.starts_with("__fields_"))
                             .map(|method| MethodInfo {
                                 name: method.name.clone(),
+                                generic_params: method.generic_params.clone(),
                                 params: method.params.clone(),
                                 param_types: method.param_types.clone(),
                                 return_type: method.return_type.clone(),
                                 visibility: method.visibility,
+                                is_static: method.is_static,
                             })
                             .collect(),
                         fields: field_names,
                         field_info,
                         is_interface: false,
+                        is_enum: false,
                     },
                 );
             }
@@ -368,24 +407,79 @@ impl ClassIndex {
                 name,
                 bases,
                 methods,
+                ..
             } => {
                 self.classes.insert(
                     name.clone(),
                     ClassInfo {
-                        bases: bases.clone(),
+                        bases: bases.iter().map(base_type_name).collect(),
                         methods: methods
                             .iter()
                             .map(|method| MethodInfo {
                                 name: method.name.clone(),
+                                generic_params: method.generic_params.clone(),
                                 params: method.params.clone(),
                                 param_types: method.param_types.clone(),
                                 return_type: method.return_type.clone(),
                                 visibility: Visibility::Public,
+                                is_static: false,
                             })
                             .collect(),
                         fields: Vec::new(),
                         field_info: HashMap::new(),
                         is_interface: true,
+                        is_enum: false,
+                    },
+                );
+            }
+            // `enum Color { Red, Green, Blue }` : chaque variant n'est
+            // accessible que sous forme qualifiée `Color.Red` (jamais en
+            // tant qu'identifiant nu), exactement comme un membre statique
+            // de classe — voir `Statement::Enum` dans le vérificateur de
+            // types (`self.classes` y stocke aussi les variants dans le
+            // même espace de noms que les classes). On réutilise donc
+            // `fields`/`field_info` pour les variants, chacun typé comme
+            // une instance de l'enum lui-même.
+            Statement::Enum {
+                name,
+                variants,
+                methods,
+                ..
+            } => {
+                let mut field_info = HashMap::new();
+                for variant in variants {
+                    field_info.insert(
+                        variant.clone(),
+                        FieldInfo {
+                            name: variant.clone(),
+                            type_annotation: Some(TypeExpr::Named(name.clone())),
+                            visibility: Visibility::Public,
+                            is_static: true,
+                        },
+                    );
+                }
+
+                self.classes.insert(
+                    name.clone(),
+                    ClassInfo {
+                        bases: Vec::new(),
+                        methods: methods
+                            .iter()
+                            .filter(|method| !method.name.starts_with("__fields_"))
+                            .map(|method| MethodInfo {
+                                name: method.name.clone(),
+                                generic_params: method.generic_params.clone(),
+                                params: method.params.clone(),
+                                param_types: method.param_types.clone(),
+                                return_type: method.return_type.clone(),
+                                visibility: method.visibility,
+                                is_static: method.is_static,
+                            })
+                            .collect(),
+                        fields: variants.clone(),
+                        field_info,
+                        is_interface: false,
+                        is_enum: true,
                     },
                 );
             }
@@ -405,7 +499,7 @@ fn collect_this_fields_in_statement(statement: &Statement, out: &mut Vec<String>
         Statement::Positioned { statement, .. } => collect_this_fields_in_statement(statement, out),
         Statement::Assignment { target, .. } => {
             if let AssignmentTarget::Member { object, name } = target {
-                if matches!(object.as_ref(), Expression::This) {
+                if matches!(object.as_ref(), Expression::SelfValue) {
                     out.push(name.clone());
                 }
             }
@@ -447,6 +541,43 @@ fn collect_this_fields_in_statement(statement: &Statement, out: &mut Vec<String>
     }
 }
 
+/// Nom de la classe/interface de base d'une clause `: Base<T>` : seul le nom
+/// compte pour retrouver les membres hérités.
+fn base_type_name(base: &TypeExpr) -> String {
+    match base {
+        TypeExpr::Named(name) => name.clone(),
+        TypeExpr::Generic { name, .. } => name.clone(),
+        other => type_expr_display(other),
+    }
+}
+
+/// Affiche des paramètres génériques : `<T: Add + Eq, U>` (vide si aucun).
+pub fn generic_params_display(params: &[GenericParam]) -> String {
+    if params.is_empty() {
+        return String::new();
+    }
+
+    let rendered = params
+        .iter()
+        .map(|param| {
+            if param.bounds.is_empty() {
+                param.name.clone()
+            } else {
+                let bounds = param
+                    .bounds
+                    .iter()
+                    .map(type_expr_display)
+                    .collect::<Vec<_>>()
+                    .join(" + ");
+                format!("{}: {}", param.name, bounds)
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+
+    format!("<{}>", rendered)
+}
+
 pub fn type_expr_display(expr: &TypeExpr) -> String {
     match expr {
         TypeExpr::Named(name) => name.clone(),
@@ -486,7 +617,7 @@ mod tests {
         let source = r#"class Person {
     private let age: int = 0;
     func initialize(age: int) -> None {
-        this.age = age;
+        self.age = age;
     }
     func name() -> str {
         return "Bruno";

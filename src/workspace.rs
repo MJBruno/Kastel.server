@@ -7,6 +7,7 @@ use crate::analyzer::{Diagnostic, analyze};
 use crate::class_index::ClassIndex;
 use crate::symbols::SymbolIndex;
 use crate::type_info::TypeInfo;
+use crate::uri_util::canonical_uri;
 
 #[derive(Debug)]
 pub struct WorkspaceDocument {
@@ -56,6 +57,8 @@ impl WorkspaceDocument {
     }
 }
 
+/// Les documents sont indexés par URI canonique (voir `uri_util::canonical_uri`) :
+/// `file:///c%3A/x/a.ks` (VS Code) et `file:///C:/x/a.ks` désignent le même document.
 #[derive(Debug, Default)]
 pub struct Workspace {
     documents: HashMap<String, WorkspaceDocument>,
@@ -80,17 +83,18 @@ impl Workspace {
 
     pub fn open(&mut self, uri: String, version: i64, text: String) {
         self.documents
-            .insert(uri, WorkspaceDocument::new(version, text));
+            .insert(canonical_uri(&uri), WorkspaceDocument::new(version, text));
     }
 
     pub fn open_file(&mut self, uri: String, path: &Path) -> std::io::Result<()> {
         let text = std::fs::read_to_string(path)?;
-        self.documents.insert(uri, WorkspaceDocument::new(0, text));
+        self.documents
+            .insert(canonical_uri(&uri), WorkspaceDocument::new(0, text));
         Ok(())
     }
 
     pub fn update(&mut self, uri: &str, version: i64, text: String) -> bool {
-        let Some(document) = self.documents.get_mut(uri) else {
+        let Some(document) = self.documents.get_mut(&canonical_uri(uri)) else {
             return false;
         };
         document.update(version, text);
@@ -98,11 +102,11 @@ impl Workspace {
     }
 
     pub fn close(&mut self, uri: &str) -> Option<WorkspaceDocument> {
-        self.documents.remove(uri)
+        self.documents.remove(&canonical_uri(uri))
     }
 
     pub fn get(&self, uri: &str) -> Option<&WorkspaceDocument> {
-        self.documents.get(uri)
+        self.documents.get(&canonical_uri(uri))
     }
 
     pub fn iter(&self) -> impl Iterator<Item = (&String, &WorkspaceDocument)> {

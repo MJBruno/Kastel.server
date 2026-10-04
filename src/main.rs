@@ -1,4 +1,5 @@
 use std::io::{self, BufRead, BufReader, Read, Write};
+use std::panic::{self, AssertUnwindSafe};
 
 use serde_json::Value;
 
@@ -46,6 +47,11 @@ impl Transport {
         }
     }
 
+    /// Lit un message LSP (`Content-Length` puis corps JSON).
+    ///
+    /// Tolérant aux fins de ligne `\n` seules, à la casse de l'en-tête et aux
+    /// en-têtes supplémentaires (`Content-Type`). Un corps JSON invalide est
+    /// signalé sur stderr et ignoré (`Value::Null`) au lieu d'arrêter le serveur.
     fn read_message(&mut self) -> io::Result<Option<Value>> {
         let mut content_length = None;
 
@@ -58,14 +64,22 @@ impl Transport {
                 return Ok(None);
             }
 
-            if line == "\r\n" {
-                break;
+            let trimmed = line.trim();
+
+            if trimmed.is_empty() {
+                if content_length.is_some() {
+                    break;
+                }
+
+                continue;
             }
 
-            if let Some(value) = line.strip_prefix("Content-Length:") {
-                content_length = Some(value.trim().parse::<usize>().map_err(|_| {
-                    io::Error::new(io::ErrorKind::InvalidData, "invalid Content-Length")
-                })?);
+            if let Some((name, value)) = trimmed.split_once(':') {
+                if name.trim().eq_ignore_ascii_case("content-length") {
+                    content_length = Some(value.trim().parse::<usize>().map_err(|_| {
+                        io::Error::new(io::ErrorKind::InvalidData, "invalid Content-Length")
+                    })?);
+                }
             }
         }
 
@@ -76,9 +90,13 @@ impl Transport {
 
         self.reader.read_exact(&mut body)?;
 
-        let message = serde_json::from_slice(&body).map_err(io::Error::other)?;
-
-        Ok(Some(message))
+        match serde_json::from_slice(&body) {
+            Ok(message) => Ok(Some(message)),
+            Err(error) => {
+                eprintln!("Invalid JSON message ignored: {error}");
+                Ok(Some(Value::Null))
+            }
+        }
     }
 
     fn send_message(&mut self, message: &RpcResponse) -> io::Result<()> {
@@ -110,11 +128,41 @@ fn main() -> io::Result<()> {
     let mut server = Server::new();
 
     while let Some(value) = transport.read_message()? {
-        eprintln!("Received LSP message");
+        // Pas de champ "method" : réponse du client à une requête du serveur
+        // (ou message invalide). Rien à traiter.
+        if value.get("method").and_then(Value::as_str).is_none() {
+            continue;
+        }
 
-        let request: RpcRequest = serde_json::from_value(value).map_err(io::Error::other)?;
+        let request: RpcRequest = match serde_json::from_value(value) {
+            Ok(request) => request,
+            Err(error) => {
+                eprintln!("Invalid LSP request ignored: {error}");
+                continue;
+            }
+        };
 
-        let messages = server.handle(request);
+        let request_id = request.id.clone();
+        let method = request.method.clone();
+
+        // Une panique dans l'analyse d'un document ne doit pas tuer le serveur.
+        let outcome = panic::catch_unwind(AssertUnwindSafe(|| server.handle(request)));
+
+        let messages = match outcome {
+            Ok(messages) => messages,
+            Err(_) => {
+                eprintln!("Internal error while handling '{method}'");
+
+                match request_id {
+                    Some(id) => vec![ServerMessage::Response(RpcResponse::error(
+                        id,
+                        -32603,
+                        format!("Internal error while handling '{method}'"),
+                    ))],
+                    None => Vec::new(),
+                }
+            }
+        };
 
         for message in messages {
             match message {

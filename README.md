@@ -46,15 +46,18 @@ editor.
 
 ## Build
 
-From the Kastel repository root:
+Le crate dépend de `kastel` par chemin **relatif** (`path = ".."` dans `Cargo.toml`) :
+le LSP doit donc se trouver dans `LSP/` à la racine du dépôt Kastel (sinon adapter ce chemin).
 
 ```text
+cd LSP
 cargo build --release
 ```
 
-The executable is produced by Cargo under `LSP/target/release/kastel-lsp`.
+L'exécutable est produit dans `target/release/kastel-lsp` (`kastel-lsp.exe` sous Windows).
+Même code source sur Windows, macOS et Linux ; `cargo test` exécute les tests d'URI propres à chaque OS.
 
 ## VS Code client
 
-Point the language client at the built `kastel-lsp` executable. No Kastel compiler
+Use the Forge VS Code extension (it bundles or auto-detects the `kastel-lsp` executable for each OS), or point any LSP client at the built `kastel-lsp` executable (stdio). No Kastel compiler
 or source-code changes outside the LSP package are required by this update.

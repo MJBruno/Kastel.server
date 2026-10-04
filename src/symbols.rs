@@ -1,7 +1,8 @@
 use std::collections::HashMap;
 
-use kastel::frontend::ast::{Statement, TypeExpr};
+use kastel::frontend::ast::{GenericParam, Statement, TypeExpr};
 
+use crate::class_index::generic_params_display;
 use crate::source_position::span_from_position;
 use crate::span::Span;
 
@@ -11,6 +12,7 @@ pub enum SymbolKind {
     Function,
     Class,
     Interface,
+    Enum,
     Import,
     TypeAlias,
 }
@@ -105,6 +107,18 @@ impl SymbolIndex {
                     self.insert(
                         name.to_string(),
                         SymbolKind::Interface,
+                        find_name_span(source, line_no, base_column, name),
+                        exported,
+                        Some(name.to_string()),
+                        None,
+                        false,
+                    );
+                }
+            } else if let Some(rest) = body.strip_prefix("enum ") {
+                if let Some(name) = first_identifier(rest) {
+                    self.insert(
+                        name.to_string(),
+                        SymbolKind::Enum,
                         find_name_span(source, line_no, base_column, name),
                         exported,
                         Some(name.to_string()),
@@ -210,12 +224,19 @@ impl SymbolIndex {
             }
             Statement::Function {
                 name,
+                generic_params,
                 params,
                 param_types,
                 return_type,
                 ..
             } => {
-                let signature = function_signature(name, params, param_types, return_type);
+                let signature = function_signature(
+                    name,
+                    generic_params,
+                    params,
+                    param_types,
+                    return_type,
+                );
                 self.insert(
                     name.clone(),
                     SymbolKind::Function,
@@ -226,29 +247,54 @@ impl SymbolIndex {
                     false,
                 );
             }
-            Statement::Class { name, .. } => {
+            Statement::Class {
+                name,
+                generic_params,
+                ..
+            } => {
                 self.insert(
                     name.clone(),
                     SymbolKind::Class,
                     find_name_span(source, line, column, name),
                     is_exported,
-                    Some(name.clone()),
+                    Some(format!("{}{}", name, generic_params_display(generic_params))),
                     None,
                     false,
                 );
             }
-            Statement::Interface { name, .. } => {
+            Statement::Interface {
+                name,
+                generic_params,
+                ..
+            } => {
                 self.insert(
                     name.clone(),
                     SymbolKind::Interface,
                     find_name_span(source, line, column, name),
                     is_exported,
-                    Some(name.clone()),
+                    Some(format!("{}{}", name, generic_params_display(generic_params))),
                     None,
                     false,
                 );
             }
-            Statement::TypeAlias { name, type_expr } => {
+            Statement::Enum {
+                name,
+                generic_params,
+                ..
+            } => {
+                self.insert(
+                    name.clone(),
+                    SymbolKind::Enum,
+                    find_name_span(source, line, column, name),
+                    is_exported,
+                    Some(format!("{}{}", name, generic_params_display(generic_params))),
+                    None,
+                    false,
+                );
+            }
+            Statement::TypeAlias {
+                name, type_expr, ..
+            } => {
                 self.insert(
                     name.clone(),
                     SymbolKind::TypeAlias,
@@ -372,6 +418,7 @@ fn type_expr_display(expr: &TypeExpr) -> String {
 
 fn function_signature(
     name: &str,
+    generic_params: &[GenericParam],
     params: &[String],
     param_types: &[Option<TypeExpr>],
     return_type: &Option<TypeExpr>,
@@ -395,7 +442,13 @@ fn function_signature(
         .as_ref()
         .map(type_expr_display)
         .unwrap_or_else(|| "dynamic".to_string());
-    format!("func {}({}) -> {}", name, args, ret)
+    format!(
+        "func {}{}({}) -> {}",
+        name,
+        generic_params_display(generic_params),
+        args,
+        ret
+    )
 }
 
 fn function_signature_from_line(name: &str, rest: &str) -> String {

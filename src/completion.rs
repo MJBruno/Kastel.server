@@ -8,8 +8,8 @@ use serde_json::{Value, json};
 
 use crate::class_index::{ClassIndex, MethodInfo};
 use crate::language::{
-    BUILTIN_FUNCTIONS, DICT_METHODS, KEYWORDS, LIST_METHODS, RANGE_METHODS, SET_METHODS,
-    STRING_METHODS, TUPLE_METHODS, TYPE_NAMES,
+    BUILTIN_FUNCTIONS, CONTEXTUAL_KEYWORDS, KEYWORDS, RECORD_METHODS, TYPE_NAMES,
+    member_table,
 };
 use crate::module_resolver::ModuleResolver;
 use crate::symbols::{Symbol, SymbolIndex, SymbolKind};
@@ -24,9 +24,11 @@ const KIND_VARIABLE: u32 = 6;
 const KIND_CLASS: u32 = 7;
 const KIND_INTERFACE: u32 = 8;
 const KIND_MODULE: u32 = 9;
+const KIND_ENUM: u32 = 13;
 const KIND_KEYWORD: u32 = 14;
 const KIND_SNIPPET: u32 = 15;
 const KIND_TYPE_PARAMETER: u32 = 25;
+const KIND_ENUM_MEMBER: u32 = 20;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct MemberContext {
@@ -176,7 +178,7 @@ fn add_receiver_completions(
     // Un typage dynamique ne permet pas de déduire une API sûre. On conserve
     // toutefois les méthodes standard d'un conteneur lorsque le type est connu.
     if items.is_empty() {
-        if let Some(name) = receiver_path.strip_prefix("this") {
+        if let Some(name) = receiver_path.strip_prefix("self") {
             if name.is_empty() {
                 if let Some(class_name) = find_enclosing_class(document, offset) {
                     add_class_members(
@@ -184,6 +186,7 @@ fn add_receiver_completions(
                         &class_name,
                         Some(class_name.as_str()),
                         true,
+                        false,
                         prefix,
                         items,
                         seen,
@@ -221,17 +224,28 @@ fn add_type_members(
                 );
             }
         }
-        Type::Named(class_name) => {
-            let current_class = if receiver_path == "this" {
+        // Classe, interface ou enum du document (y compris instanciée avec des
+        // arguments de type : `Boite<int>`). Elle prime sur un handle du
+        // runtime de même nom.
+        Type::Named(class_name)
+        | Type::Generic {
+            name: class_name, ..
+        } if document.classes.contains(class_name) => {
+            let current_class = if receiver_path == "self" {
                 find_enclosing_class(document, offset)
             } else {
                 None
             };
+            // `Color.` / `Compteur.` : accès qualifié par le NOM de la classe,
+            // donc membres `static` (et variants d'enum) uniquement ;
+            // `valeur.` / `self.` : membres d'instance uniquement.
+            let static_access = receiver_path == class_name.as_str();
             add_class_members(
                 &document.classes,
                 class_name,
                 current_class.as_deref(),
-                receiver_path == "this",
+                receiver_path == "self",
+                static_access,
                 prefix,
                 items,
                 seen,
@@ -254,24 +268,6 @@ fn add_type_members(
                 }
             }
         }
-        Type::Array(_) | Type::ArrayDynamic => {
-            add_table_members(LIST_METHODS, prefix, KIND_METHOD, items, seen);
-        }
-        Type::Dict(_, _) | Type::DictDynamic => {
-            add_table_members(DICT_METHODS, prefix, KIND_METHOD, items, seen);
-        }
-        Type::Tuple(_) | Type::TupleDynamic => {
-            add_table_members(TUPLE_METHODS, prefix, KIND_METHOD, items, seen);
-        }
-        Type::Set(_) | Type::SetDynamic => {
-            add_table_members(SET_METHODS, prefix, KIND_METHOD, items, seen);
-        }
-        Type::Str => {
-            add_table_members(STRING_METHODS, prefix, KIND_METHOD, items, seen);
-        }
-        Type::Range => {
-            add_table_members(RANGE_METHODS, prefix, KIND_METHOD, items, seen);
-        }
         Type::Record(fields) => {
             for (name, field_type) in fields {
                 if !name.starts_with(prefix) || !seen.insert(name.clone()) {
@@ -284,23 +280,18 @@ fn add_type_members(
                     "sortText": format!("0_{}", name),
                 }));
             }
-            for name in ["keys", "values", "entries", "copy", "to_string"] {
-                if name.starts_with(prefix) && seen.insert(name.to_string()) {
-                    items.push(json!({
-                        "label": name,
-                        "kind": KIND_METHOD,
-                        "detail": "Record method",
-                        "insertText": format!("{}($0)", name),
-                        "insertTextFormat": 2,
-                        "sortText": format!("2_{}", name),
-                    }));
-                }
+            add_table_members(RECORD_METHODS, prefix, KIND_METHOD, items, seen);
+        }
+        // Conteneurs standard, Option/Result, Task, Channel, Mutex,
+        // Semaphore, WaitGroup, Iterator : tables de `language.rs`.
+        other => {
+            if let Some(table) = member_table(other) {
+                add_table_members(table, prefix, KIND_METHOD, items, seen);
             }
         }
-        _ => {}
     }
 
-    // `offset` est utilisé comme argument de résolution du type de `this`;
+    // `offset` est utilisé comme argument de résolution du type de `self`;
     // conserver le paramètre dans l'API rend la fonction extensible pour les
     // futures scopes locales.
     let _ = offset;
@@ -313,21 +304,15 @@ pub(crate) fn infer_receiver_types(
     receiver_path: &str,
     offset: usize,
 ) -> Vec<Type> {
-    if receiver_path == "this" {
+    if receiver_path == "self" {
         return find_enclosing_class(document, offset)
             .and_then(|name| Some(vec![Type::Named(name)]))
             .unwrap_or_default();
     }
 
-    if receiver_path == "base" {
-        let Some(class_name) = find_enclosing_class(document, offset) else {
-            return Vec::new();
-        };
-        let Some(info) = document.classes.get(&class_name) else {
-            return Vec::new();
-        };
-        return info.bases.iter().cloned().map(Type::Named).collect();
-    }
+    // Il n'existe pas de rappel de classe de base en Kastel (pas d'héritage
+    // d'implémentation, seulement des interfaces) : aucun receveur `base`/
+    // `super` n'a donc de sens ici.
 
     if let Some(first) = receiver_path.split('.').next() {
         if let Some(ty) = document.types.get(first) {
@@ -703,16 +688,29 @@ fn add_class_members(
     class_name: &str,
     current_class: Option<&str>,
     allow_private: bool,
+    static_access: bool,
     prefix: &str,
     items: &mut Vec<Value>,
     seen: &mut HashSet<String>,
 ) {
+    let is_enum = classes.is_enum(class_name);
     for field_name in classes.all_fields(class_name) {
+        let field_is_static = classes
+            .field(class_name, field_name)
+            .is_some_and(|field| field.is_static);
+        if field_is_static != static_access {
+            continue;
+        }
         let visible = classes
             .field(class_name, field_name)
             .map(|field| match field.visibility {
                 Visibility::Public => true,
-                Visibility::Private => {
+                // `private` et `protected` restent tous deux limités à la
+                // classe qui déclare le membre : il n'existe pas d'héritage
+                // d'implémentation en Kastel, donc `protected` ne peut plus
+                // être justifié par une relation de sous-classe (voir
+                // `type_checker::is_same_class`).
+                Visibility::Private | Visibility::Protected => {
                     allow_private
                         && classes.field_owner(class_name, field_name).as_deref() == current_class
                 }
@@ -721,22 +719,32 @@ fn add_class_members(
         if !visible || !field_name.starts_with(prefix) || !seen.insert(field_name.to_string()) {
             continue;
         }
-        let detail = classes
-            .field(class_name, field_name)
-            .and_then(|field| field.type_annotation.as_ref())
-            .map(crate::class_index::type_expr_display)
-            .map(|ty| format!("{}: {}", field_name, ty))
-            .unwrap_or_else(|| field_name.to_string());
+        let detail = if is_enum {
+            format!("{}.{}", class_name, field_name)
+        } else {
+            classes
+                .field(class_name, field_name)
+                .and_then(|field| field.type_annotation.as_ref())
+                .map(crate::class_index::type_expr_display)
+                .map(|ty| format!("{}: {}", field_name, ty))
+                .unwrap_or_else(|| field_name.to_string())
+        };
         items.push(json!({
             "label": field_name,
-            "kind": KIND_FIELD,
+            "kind": if is_enum { KIND_ENUM_MEMBER } else { KIND_FIELD },
             "detail": detail,
             "sortText": format!("0_{}", field_name),
         }));
     }
 
     for method in classes.all_methods(class_name) {
-        if method.visibility == Visibility::Private {
+        if method.is_static != static_access {
+            continue;
+        }
+        if matches!(
+            method.visibility,
+            Visibility::Private | Visibility::Protected
+        ) {
             let owner_is_current =
                 classes.method_owner(class_name, &method.name).as_deref() == current_class;
             if !allow_private || !owner_is_current {
@@ -759,7 +767,11 @@ fn method_completion(method: &MethodInfo, sort_prefix: &str) -> Value {
         "insertTextFormat": 2,
         "documentation": {
             "kind": "markdown",
-            "value": format!("Méthode de classe{}.", if method.visibility == Visibility::Private { " privée" } else { "" })
+            "value": format!("Méthode de classe{}.", match method.visibility {
+                Visibility::Private => " privée",
+                Visibility::Protected => " protégée",
+                Visibility::Public => "",
+            })
         },
         "sortText": format!("{}{}", sort_prefix, method.name),
     })
@@ -952,6 +964,31 @@ fn add_keyword_completions(prefix: &str, items: &mut Vec<Value>, seen: &mut Hash
             }));
         }
     }
+
+    // Mots contextuels : `public`/`protected`/`private`/`static` dans un corps
+    // de classe, `type` pour un alias (`type Nom = ...;`).
+    for keyword in CONTEXTUAL_KEYWORDS {
+        if !keyword.starts_with(prefix) || !seen.insert((*keyword).to_string()) {
+            continue;
+        }
+        if *keyword == "type" {
+            items.push(json!({
+                "label": keyword,
+                "kind": KIND_SNIPPET,
+                "detail": "Kastel snippet",
+                "insertText": "type ${1:Name} = ${0};",
+                "insertTextFormat": 2,
+                "sortText": format!("3_{}", keyword),
+            }));
+        } else {
+            items.push(json!({
+                "label": keyword,
+                "kind": KIND_KEYWORD,
+                "detail": "Kastel modifier",
+                "sortText": format!("4_{}", keyword),
+            }));
+        }
+    }
 }
 
 fn keyword_snippet(keyword: &str) -> Option<&'static str> {
@@ -961,6 +998,7 @@ fn keyword_snippet(keyword: &str) -> Option<&'static str> {
         "func" => "func ${1:name}(${2}) -> ${3:dynamic} {\n\t${0}\n}",
         "class" => "class ${1:Name} {\n\t${0}\n}",
         "interface" => "interface ${1:Name} {\n\t${0}\n}",
+        "enum" => "enum ${1:Name} {\n\t${0}\n}",
         "if" => "if ${1:condition} {\n\t${0}\n}",
         "else" => "else {\n\t${0}\n}",
         "while" => "while ${1:condition} {\n\t${0}\n}",
@@ -1034,6 +1072,7 @@ fn symbol_completion(symbol: &Symbol, imported: bool) -> Value {
         SymbolKind::Function => KIND_FUNCTION,
         SymbolKind::Class => KIND_CLASS,
         SymbolKind::Interface => KIND_INTERFACE,
+        SymbolKind::Enum => KIND_ENUM,
         SymbolKind::Import => KIND_MODULE,
         SymbolKind::TypeAlias => KIND_TYPE_PARAMETER,
     };
@@ -1041,7 +1080,7 @@ fn symbol_completion(symbol: &Symbol, imported: bool) -> Value {
         signature.clone()
     } else if let Some(ty) = &symbol.type_display {
         match symbol.kind {
-            SymbolKind::Class | SymbolKind::Interface => ty.clone(),
+            SymbolKind::Class | SymbolKind::Interface | SymbolKind::Enum => ty.clone(),
             _ => format!("{}: {}", symbol.name, ty),
         }
     } else {
@@ -1050,6 +1089,7 @@ fn symbol_completion(symbol: &Symbol, imported: bool) -> Value {
             SymbolKind::Function => "function".to_string(),
             SymbolKind::Class => "class".to_string(),
             SymbolKind::Interface => "interface".to_string(),
+            SymbolKind::Enum => "enum".to_string(),
             SymbolKind::Import => "module".to_string(),
             SymbolKind::TypeAlias => "type alias".to_string(),
         }
