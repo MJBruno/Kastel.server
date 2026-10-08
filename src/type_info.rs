@@ -1,7 +1,9 @@
 use std::collections::HashMap;
 
 use kastel::compiler::types::{FunctionType, Type};
-use kastel::frontend::ast::{BinaryOp, Expression, Literal, Statement, TypeExpr, UnaryOp};
+use kastel::frontend::ast::{
+    BinaryOp, Expression, Literal, Pattern, Statement, TypeExpr, UnaryOp,
+};
 
 #[derive(Debug, Clone, Default)]
 pub struct TypeInfo {
@@ -40,7 +42,8 @@ impl FunctionSignature {
         };
 
         format!(
-            "func {}{}({}) -> {}",
+            "{}func {}{}({}) -> {}",
+            if self.is_async { "async " } else { "" },
             self.name,
             generics,
             self.params
@@ -92,6 +95,10 @@ impl TypeInfo {
             .or_else(|| receiver.mutex_member_type(name))
             .or_else(|| receiver.semaphore_member_type(name))
             .or_else(|| receiver.wait_group_member_type(name))
+            .or_else(|| receiver.barrier_member_type(name))
+            .or_else(|| receiver.rwlock_member_type(name))
+            .or_else(|| receiver.event_member_type(name))
+            .or_else(|| receiver.condvar_member_type(name))
     }
 }
 
@@ -227,21 +234,34 @@ fn collect_statements(
                 scopes.pop();
             }
             Statement::ForIn {
-                variable,
+                pattern,
                 iterable,
                 body,
             } => {
-                let element_type =
-                    infer_expression(info, iterable, scopes.last().unwrap()).element_type();
+                // `for x in items`, `for (x, y) in items`, `for [a, b] in rows` :
+                // chaque variable du pattern reçoit son type d'élément.
+                let iterable_type = infer_expression(info, iterable, scopes.last().unwrap());
+                let element_type = iteration_element_type(&iterable_type);
                 let mut loop_scope = HashMap::new();
-                loop_scope.insert(variable.clone(), element_type);
+                bind_pattern(pattern, &element_type, &mut loop_scope);
+                // Comme pour `let`, les variables de boucle alimentent l'index
+                // plat utilisé par le survol et la complétion.
+                for (name, ty) in &loop_scope {
+                    info.symbols.insert(name.clone(), ty.clone());
+                }
                 scopes.push(loop_scope);
                 collect_statements(body, info, scopes);
                 scopes.pop();
             }
-            Statement::Match { arms, .. } => {
+            Statement::Match { value, arms } => {
+                let subject_type = infer_expression(info, value, scopes.last().unwrap());
                 for arm in arms {
-                    scopes.push(HashMap::new());
+                    let mut arm_scope = HashMap::new();
+                    bind_pattern(&arm.pattern, &subject_type, &mut arm_scope);
+                    for (name, ty) in &arm_scope {
+                        info.symbols.insert(name.clone(), ty.clone());
+                    }
+                    scopes.push(arm_scope);
                     collect_statements(&arm.body, info, scopes);
                     scopes.pop();
                 }
@@ -272,6 +292,89 @@ fn collect_statements(
                 }
             }
             _ => {}
+        }
+    }
+}
+
+/// Type produit à chaque tour de boucle `for`.
+///
+/// Même règle que `Type::iterator_element_type` côté compilateur (non
+/// exportée) : un `Dict` produit ses CLÉS, un `Range` des `int`, une `str`
+/// ses caractères (`str`).
+fn iteration_element_type(iterable: &Type) -> Type {
+    match iterable {
+        Type::Array(element) | Type::Set(element) => (**element).clone(),
+        Type::Tuple(elements) => elements
+            .iter()
+            .cloned()
+            .reduce(|a, b| a.merge(&b))
+            .unwrap_or(Type::Dynamic),
+        Type::Dict(key, _) => (**key).clone(),
+        Type::Str => Type::Str,
+        Type::Range => Type::Int,
+        _ => Type::Dynamic,
+    }
+}
+
+/// Argument `index` d'un type générique nommé (`Option<T>`, `Result<T, E>`).
+fn generic_argument(ty: &Type, expected: &str, index: usize) -> Type {
+    match ty {
+        Type::Generic { name, arguments } if name == expected => {
+            arguments.get(index).cloned().unwrap_or(Type::Dynamic)
+        }
+        _ => Type::Dynamic,
+    }
+}
+
+/// Lie les variables d'un pattern (`for` ou `match`) à leur type.
+///
+/// Un tuple `(x, y)` confronté à `Tuple([int, str])` donne `x: int`,
+/// `y: str` ; quand la forme n'est pas connue statiquement, les variables
+/// restent `dynamic` (typage graduel de Kastel).
+fn bind_pattern(pattern: &Pattern, ty: &Type, out: &mut HashMap<String, Type>) {
+    match pattern {
+        Pattern::Binding(name) => {
+            out.insert(name.clone(), ty.clone());
+        }
+        Pattern::Wildcard | Pattern::Literal(_) | Pattern::EnumVariant { .. } => {}
+        Pattern::Or(alternatives) => {
+            for alternative in alternatives {
+                bind_pattern(alternative, ty, out);
+            }
+        }
+        Pattern::Range { start, end, .. } => {
+            bind_pattern(start, ty, out);
+            bind_pattern(end, ty, out);
+        }
+        Pattern::Tuple(items) => match ty {
+            Type::Tuple(elements) if elements.len() == items.len() => {
+                for (item, element) in items.iter().zip(elements) {
+                    bind_pattern(item, element, out);
+                }
+            }
+            _ => {
+                for item in items {
+                    bind_pattern(item, &Type::Dynamic, out);
+                }
+            }
+        },
+        Pattern::Array(items) | Pattern::ArrayRest(items) => {
+            let element = match ty {
+                Type::Array(element) => (**element).clone(),
+                _ => Type::Dynamic,
+            };
+            for item in items {
+                bind_pattern(item, &element, out);
+            }
+        }
+        Pattern::OptionSome(inner) => {
+            bind_pattern(inner, &generic_argument(ty, "Option", 0), out);
+        }
+        Pattern::ResultOk(inner) => {
+            bind_pattern(inner, &generic_argument(ty, "Result", 0), out);
+        }
+        Pattern::ResultErr(inner) => {
+            bind_pattern(inner, &generic_argument(ty, "Result", 1), out);
         }
     }
 }
@@ -528,6 +631,24 @@ fn infer_intrinsic_call(
         "mutex" => Type::Named("Mutex".to_string()),
         "semaphore" => Type::Named("Semaphore".to_string()),
         "wait_group" => Type::Named("WaitGroup".to_string()),
+        "barrier" => Type::Named("Barrier".to_string()),
+        "rwlock" => Type::Named("RwLock".to_string()),
+        "event" => Type::Named("Event".to_string()),
+        "condvar" => Type::Named("Condvar".to_string()),
+        "tcp_connect" => Type::Named("TcpStream".to_string()),
+        "tcp_listen" => Type::Named("TcpListener".to_string()),
+        "udp_bind" => Type::Named("UdpSocket".to_string()),
+        "regex_escape" => Type::Str,
+        "http_get" | "http_request" => Type::Record(vec![
+            ("status".to_string(), Type::Int),
+            (
+                "headers".to_string(),
+                Type::Dict(Box::new(Type::Str), Box::new(Type::Str)),
+            ),
+            ("body".to_string(), Type::Array(Box::new(Type::Int))),
+            ("version".to_string(), Type::Str),
+            ("reason".to_string(), Type::Str),
+        ]),
         _ => return None,
     })
 }

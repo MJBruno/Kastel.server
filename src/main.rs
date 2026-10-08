@@ -5,6 +5,7 @@ use serde_json::Value;
 
 mod analyzer;
 mod class_index;
+mod code_actions;
 mod completion;
 mod definition;
 mod diagnostics;

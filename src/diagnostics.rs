@@ -41,11 +41,18 @@ pub fn build_diagnostics(uri: &str, source: &str, diagnostics: Vec<Diagnostic>) 
     })
 }
 
+fn is_word_character(character: char) -> bool {
+    character.is_alphanumeric() || character == '_'
+}
+
 /// Calcule la position UTF-16 de fin du diagnostic.
 ///
 /// `column` est un index de **caractère** 1-based (même convention
 /// que `LexerError::column`, `ParserError::column`, et que
 /// `crate::position::kastel_to_lsp`).
+///
+/// Si le diagnostic démarre sur un mot (identifiant, mot-clé, nombre), le
+/// soulignement couvre le mot entier ; sinon un seul caractère.
 fn diagnostic_end_character(source: &str, line: usize, column: usize, start_character: u32) -> u32 {
     let line_index = line.saturating_sub(1);
 
@@ -55,11 +62,25 @@ fn diagnostic_end_character(source: &str, line: usize, column: usize, start_char
 
     let column_index = column.saturating_sub(1);
 
-    let Some(character) = line_text.chars().nth(column_index) else {
+    let mut characters = line_text.chars().skip(column_index);
+
+    let Some(first) = characters.next() else {
         return start_character.saturating_add(1);
     };
 
-    start_character.saturating_add(character.len_utf16() as u32)
+    let mut length = first.len_utf16() as u32;
+
+    if is_word_character(first) {
+        for character in characters {
+            if !is_word_character(character) {
+                break;
+            }
+
+            length += character.len_utf16() as u32;
+        }
+    }
+
+    start_character.saturating_add(length)
 }
 
 #[cfg(test)]
@@ -67,12 +88,29 @@ mod tests {
     use super::*;
 
     #[test]
-    fn ascii_diagnostic_spans_one_character() {
+    fn ascii_diagnostic_spans_whole_word() {
         let source = "const VALUE = 42\n";
 
         let end = diagnostic_end_character(source, 1, 7, 6);
 
-        assert_eq!(end, 7);
+        assert_eq!(end, 11);
+    }
+
+    #[test]
+    fn diagnostic_on_symbol_spans_one_character() {
+        let source = "let x = a + b;\n";
+
+        let end = diagnostic_end_character(source, 1, 11, 10);
+
+        assert_eq!(end, 11);
+    }
+
+    #[test]
+    fn diagnostic_stops_at_end_of_word() {
+        let source = "foo(Add, Ord)\n";
+
+        // `Add` commence à la colonne 5 (index 4) et se termine avant la virgule.
+        assert_eq!(diagnostic_end_character(source, 1, 5, 4), 7);
     }
 
     #[test]
@@ -90,7 +128,7 @@ mod tests {
 
         let end = diagnostic_end_character(source, 1, 2, 2);
 
-        assert_eq!(end, 3);
+        assert_eq!(end, 5);
     }
 
     #[test]
@@ -123,7 +161,7 @@ mod tests {
 
         assert_eq!(diag["range"]["start"]["character"], 2);
 
-        assert_eq!(diag["range"]["end"]["character"], 3);
+        assert_eq!(diag["range"]["end"]["character"], 5);
 
         assert_eq!(diag["severity"], 1);
         assert_eq!(diag["code"], "test");

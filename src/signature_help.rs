@@ -393,9 +393,9 @@ mod tests {
         ws.open(
             "file:///main.ks".to_string(),
             1,
-            "func add(a: int, b: int) -> int { return a + b }\nadd(1, ".to_string(),
+            "func add(a: int, b: int) -> int {\n    return a + b;\n}\n\nadd(1, 2);\n".to_string(),
         );
-        let line = 1;
+        let line = 4;
         let character = 7;
         let help = build_signature_help(&ws, "file:///main.ks", line, character).unwrap();
         assert_eq!(help["activeParameter"], 1);

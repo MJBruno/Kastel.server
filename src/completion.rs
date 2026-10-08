@@ -345,15 +345,18 @@ pub(crate) fn infer_receiver_types(
         return vec![Type::Named(class_name)];
     }
 
-    // Résolution d'un alias de module simple.
+    // Résolution d'un alias de module simple (`import std.math;` -> `math.sqrt(...)`).
+    // `Type::Module` porte le chemin *pointé* du module (`std.math`), jamais un
+    // chemin de fichier : tous les consommateurs le re-découpent sur '.', ce qui
+    // casserait sous Windows (`C:\...\math.ks`) comme ailleurs.
     if let Some(import) = parse_import_bindings(&document.text)
         .into_iter()
-        .find(|i| i.local == receiver_path)
+        .find(|i| i.is_module && i.local == receiver_path)
     {
         if let Some(current_file) = uri_to_path(uri) {
             let resolver = ModuleResolver::new(workspace.root().map(Path::to_path_buf));
-            if let Some(module_path) = resolver.resolve(&current_file, &import.parts) {
-                return vec![Type::Module(module_path.to_string_lossy().to_string())];
+            if resolver.resolve(&current_file, &import.parts).is_some() {
+                return vec![Type::Module(import.parts.join("."))];
             }
         }
     }
@@ -852,7 +855,7 @@ fn resolve_module_path(workspace: &Workspace, uri: &str, receiver: &str) -> Opti
 
     for import in imports {
         let full = import.parts.join(".");
-        if receiver == full || receiver == import.local {
+        if receiver == full || (import.is_module && receiver == import.local) {
             return resolver.resolve(&current_file, &import.parts);
         }
     }
@@ -867,6 +870,9 @@ fn resolve_module_path(workspace: &Workspace, uri: &str, receiver: &str) -> Opti
 struct ImportBinding {
     parts: Vec<String>,
     local: String,
+    /// `true` pour `import a.b;` (le nom local désigne un module),
+    /// `false` pour `from a import b` (le nom local désigne un export).
+    is_module: bool,
 }
 
 fn parse_import_bindings(source: &str) -> Vec<ImportBinding> {
@@ -887,6 +893,7 @@ fn parse_import_bindings(source: &str) -> Vec<ImportBinding> {
                 imports.push(ImportBinding {
                     local: last.clone(),
                     parts,
+                    is_module: true,
                 });
             }
             continue;
@@ -910,6 +917,7 @@ fn parse_import_bindings(source: &str) -> Vec<ImportBinding> {
                     imports.push(ImportBinding {
                         local: local.to_string(),
                         parts: parts.clone(),
+                        is_module: false,
                     });
                 }
             }
@@ -965,6 +973,23 @@ fn add_keyword_completions(prefix: &str, items: &mut Vec<Value>, seen: &mut Hash
         }
     }
 
+    // `for` avec destructuration de pattern : `for (a, b) in items { }`.
+    // Le parser accepte tout pattern irréfutable après `for` (tuple, liste,
+    // tuples imbriqués, `_`).
+    if "for".starts_with(prefix) {
+        for (label, snippet, detail) in FOR_PATTERN_SNIPPETS {
+            items.push(json!({
+                "label": *label,
+                "filterText": "for",
+                "kind": KIND_SNIPPET,
+                "detail": *detail,
+                "insertText": *snippet,
+                "insertTextFormat": 2,
+                "sortText": "3_for_pattern",
+            }));
+        }
+    }
+
     // Mots contextuels : `public`/`protected`/`private`/`static` dans un corps
     // de classe, `type` pour un alias (`type Nom = ...;`).
     for keyword in CONTEXTUAL_KEYWORDS {
@@ -991,11 +1016,30 @@ fn add_keyword_completions(prefix: &str, items: &mut Vec<Value>, seen: &mut Hash
     }
 }
 
+/// Variantes de `for` avec destructuration : `(label, snippet, détail)`.
+///
+/// Un pattern tuple `(a, b)` exige des éléments `Tuple` (ou `dynamic`) ;
+/// `Dict.entries()` produit des `List`, donc des patterns liste `[k, v]`.
+const FOR_PATTERN_SNIPPETS: &[(&str, &str, &str)] = &[
+    (
+        "for (a, b) in",
+        "for (${1:a}, ${2:b}) in ${3:items} {\n\t${0}\n}",
+        "Kastel snippet : destructuration d'un tuple",
+    ),
+    (
+        "for [k, v] in .entries()",
+        "for [${1:key}, ${2:value}] in ${3:dict}.entries() {\n\t${0}\n}",
+        "Kastel snippet : clé et valeur d'un Dict",
+    ),
+];
+
 fn keyword_snippet(keyword: &str) -> Option<&'static str> {
     Some(match keyword {
         "const" => "const ${1:NAME} = ${0}",
         "let" => "let ${1:name} = ${0}",
         "func" => "func ${1:name}(${2}) -> ${3:dynamic} {\n\t${0}\n}",
+        "async" => "async func ${1:name}(${2}) -> ${3:dynamic} {\n\t${0}\n}",
+        "await" => "await ${0}",
         "class" => "class ${1:Name} {\n\t${0}\n}",
         "interface" => "interface ${1:Name} {\n\t${0}\n}",
         "enum" => "enum ${1:Name} {\n\t${0}\n}",
@@ -1006,8 +1050,8 @@ fn keyword_snippet(keyword: &str) -> Option<&'static str> {
         "import" => "import ${1:module.path}",
         "from" => "from ${1:module} import ${2:name}",
         "export" => "export ${0}",
-        "try" => "try {\n\t${0}\n} catch ${1:error} {\n\t\n}",
-        "catch" => "catch ${1:error} {\n\t${0}\n}",
+        "try" => "try {\n\t${0}\n} catch (${1:error}) {\n\t\n}",
+        "catch" => "catch (${1:error}) {\n\t${0}\n}",
         "finally" => "finally {\n\t${0}\n}",
         "throw" => "throw ${0}",
         "new" => "new ${1:ClassName}(${0})",
@@ -1250,6 +1294,7 @@ fn is_identifier_char_string(s: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::language::LIST_METHODS;
 
     #[test]
     fn detects_partial_member_access() {
@@ -1260,7 +1305,7 @@ mod tests {
 
     #[test]
     fn detects_nested_member_access() {
-        let ctx = detect_member_access("math.core.Co", 13).unwrap();
+        let ctx = detect_member_access("math.core.Co", 12).unwrap();
         assert_eq!(ctx.receiver, "math.core");
         assert_eq!(ctx.prefix, "Co");
     }

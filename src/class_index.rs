@@ -603,6 +603,31 @@ pub fn type_expr_display(expr: &TypeExpr) -> String {
                 .collect::<Vec<_>>()
                 .join(", ")
         ),
+        // `(int, str)`, `()` ; un tuple à un élément s'écrit `(int,)`.
+        TypeExpr::Tuple(items) if items.len() == 1 => {
+            format!("({},)", type_expr_display(&items[0]))
+        }
+        TypeExpr::Tuple(items) => format!(
+            "({})",
+            items
+                .iter()
+                .map(type_expr_display)
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+        // `func(int, str) -> bool`
+        TypeExpr::Function {
+            params,
+            return_type,
+        } => format!(
+            "func({}) -> {}",
+            params
+                .iter()
+                .map(type_expr_display)
+                .collect::<Vec<_>>()
+                .join(", "),
+            type_expr_display(return_type)
+        ),
     }
 }
 

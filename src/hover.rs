@@ -559,6 +559,7 @@ fn parse_imports(source: &str) -> Vec<ImportPath> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::language::LIST_METHODS;
     use crate::workspace::Workspace;
 
     #[test]

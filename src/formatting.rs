@@ -58,7 +58,13 @@ pub fn format_source(source: &str, tab_size: u32, insert_spaces: bool) -> String
     };
 
     let normalized = source.replace("\r\n", "\n").replace('\r', "\n");
-    let raw_lines: Vec<&str> = normalized.split('\n').collect();
+
+    // `return a;}` -> `return a;` puis `}` quand l'accolade ferme un bloc ouvert plus haut.
+    let mut split_comment_state = false;
+    let raw_lines: Vec<String> = normalized
+        .split('\n')
+        .flat_map(|line| split_stray_closing_braces(line, &mut split_comment_state))
+        .collect();
 
     let mut depth: i64 = 0;
     let mut in_block_comment = false;
@@ -73,7 +79,7 @@ pub fn format_source(source: &str, tab_size: u32, insert_spaces: bool) -> String
             continue;
         }
 
-        let formatted_content = normalize_line(raw_line, &mut in_block_comment);
+        let formatted_content = normalize_line(&raw_line, &mut in_block_comment);
         let content = formatted_content.trim_end();
 
         if content.is_empty() {
@@ -115,6 +121,103 @@ pub fn format_source(source: &str, tab_size: u32, insert_spaces: bool) -> String
     }
 
     result
+}
+
+/// Sépare les `}` qui ferment un bloc ouvert sur une ligne précédente lorsqu'ils
+/// suivent du code sur la même ligne :
+///
+/// ```text
+///     if a == b {
+///         return a;}          ->   return a;   puis   }
+/// ```
+///
+/// Les accolades équilibrées sur une même ligne (`if a == b {return a;}`,
+/// `{ a: 1 }`) ne sont jamais touchées, pas plus que celles placées dans une
+/// chaîne ou un commentaire. Un `}` en début de ligne (`} else {`) reste en place.
+fn split_stray_closing_braces(line: &str, in_block_comment: &mut bool) -> Vec<String> {
+    let chars: Vec<char> = line.chars().collect();
+    let mut cuts: Vec<usize> = Vec::new();
+    let mut depth = 0usize;
+    let mut has_code = false;
+    let mut i = 0usize;
+
+    while i < chars.len() {
+        if *in_block_comment {
+            if chars[i] == '*' && i + 1 < chars.len() && chars[i + 1] == '/' {
+                *in_block_comment = false;
+                i += 2;
+            } else {
+                i += 1;
+            }
+            continue;
+        }
+
+        match chars[i] {
+            '"' | '\'' => {
+                let quote = chars[i];
+                has_code = true;
+                i += 1;
+
+                while i < chars.len() {
+                    if chars[i] == '\\' && i + 1 < chars.len() {
+                        i += 2;
+                        continue;
+                    }
+
+                    i += 1;
+
+                    if chars[i - 1] == quote {
+                        break;
+                    }
+                }
+            }
+            '/' if i + 1 < chars.len() && chars[i + 1] == '/' => break,
+            '/' if i + 1 < chars.len() && chars[i + 1] == '*' => {
+                *in_block_comment = true;
+                i += 2;
+            }
+            '{' => {
+                depth += 1;
+                has_code = true;
+                i += 1;
+            }
+            '}' => {
+                if depth > 0 {
+                    depth -= 1;
+                    has_code = true;
+                } else if has_code {
+                    // Ferme un bloc ouvert plus haut, après du code : nouvelle ligne ici.
+                    cuts.push(i);
+                    has_code = false;
+                }
+
+                i += 1;
+            }
+            character => {
+                if !character.is_whitespace() {
+                    has_code = true;
+                }
+
+                i += 1;
+            }
+        }
+    }
+
+    if cuts.is_empty() {
+        return vec![line.to_string()];
+    }
+
+    let mut parts = Vec::with_capacity(cuts.len() + 1);
+    let mut start = 0usize;
+
+    for cut in cuts {
+        parts.push(chars[start..cut].iter().collect::<String>());
+        start = cut;
+    }
+
+    parts.push(chars[start..].iter().collect::<String>());
+
+    parts
 }
 
 /// Normalise une ligne sans modifier le contenu exact des chaînes et commentaires.
@@ -258,17 +361,22 @@ enum TokenKind {
 struct Token {
     kind: TokenKind,
     text: String,
+    /// Un espace précédait ce jeton dans la source (sert à conserver le
+    /// remplissage des blocs `{ … }` écrits sur une seule ligne).
+    space_before: bool,
 }
 
 fn tokenize_code(code: &str) -> Vec<Token> {
     let chars: Vec<char> = code.chars().collect();
     let mut tokens = Vec::new();
     let mut i = 0usize;
+    let mut pending_space = false;
 
     while i < chars.len() {
         let c = chars[i];
 
         if c.is_whitespace() {
+            pending_space = true;
             i += 1;
             continue;
         }
@@ -280,6 +388,7 @@ fn tokenize_code(code: &str) -> Vec<Token> {
                 i += 1;
             }
             tokens.push(Token {
+                space_before: std::mem::take(&mut pending_space),
                 kind: TokenKind::Word,
                 text: chars[start..i].iter().collect(),
             });
@@ -295,6 +404,7 @@ fn tokenize_code(code: &str) -> Vec<Token> {
                 i += 1;
             }
             tokens.push(Token {
+                space_before: std::mem::take(&mut pending_space),
                 kind: TokenKind::Number,
                 text: chars[start..i].iter().collect(),
             });
@@ -316,6 +426,7 @@ fn tokenize_code(code: &str) -> Vec<Token> {
                 }
             }
             tokens.push(Token {
+                space_before: std::mem::take(&mut pending_space),
                 kind: TokenKind::String,
                 text: chars[start..i].iter().collect(),
             });
@@ -346,6 +457,7 @@ fn tokenize_code(code: &str) -> Vec<Token> {
         if let Some(text) = operator {
             let len = text.chars().count();
             tokens.push(Token {
+                space_before: std::mem::take(&mut pending_space),
                 kind: TokenKind::Operator,
                 text,
             });
@@ -371,13 +483,66 @@ fn tokenize_code(code: &str) -> Vec<Token> {
         };
 
         tokens.push(Token {
+                space_before: std::mem::take(&mut pending_space),
             kind,
             text: c.to_string(),
         });
         i += 1;
     }
 
-    tokens
+    split_generic_close_equal(tokens)
+}
+
+/// `let v: List<int>=[]` : le lexer produit `>=` ; si le `>` ferme un générique,
+/// on le sépare en `>` et `=`.
+fn split_generic_close_equal(tokens: Vec<Token>) -> Vec<Token> {
+    let mut out: Vec<Token> = Vec::with_capacity(tokens.len() + 2);
+
+    for token in tokens {
+        if token.kind == TokenKind::Operator && token.text == ">=" && closes_open_generic(&out) {
+            out.push(Token {
+                kind: TokenKind::Operator,
+                text: ">".to_string(),
+                space_before: token.space_before,
+            });
+            out.push(Token {
+                kind: TokenKind::Operator,
+                text: "=".to_string(),
+                space_before: false,
+            });
+        } else {
+            out.push(token);
+        }
+    }
+
+    out
+}
+
+/// Vrai s'il reste un `<` de paramètres de type ouvert (non refermé) dans `tokens`.
+fn closes_open_generic(tokens: &[Token]) -> bool {
+    let mut depth = 0usize;
+
+    for index in (0..tokens.len()).rev() {
+        let token = &tokens[index];
+
+        match token.kind {
+            TokenKind::Semicolon | TokenKind::OpenBrace | TokenKind::CloseBrace => return false,
+            TokenKind::Operator if token.text == ">" => depth += 1,
+            TokenKind::Operator if token.text == "<" => {
+                if depth == 0 {
+                    return index >= 1
+                        && tokens[index - 1].kind == TokenKind::Word
+                        && (is_generic_head(&tokens[index - 1].text)
+                            || follows_declaration_keyword(index, tokens));
+                }
+
+                depth -= 1;
+            }
+            _ => {}
+        }
+    }
+
+    false
 }
 
 fn needs_space_between(
@@ -395,6 +560,17 @@ fn needs_space_between(
         _ => {}
     }
 
+    // Bloc `{ … }` sur une seule ligne : l'espace après `{` et avant `}` est conservé
+    // tel qu'il est écrit (`{return a;}` reste `{return a;}`, `{ a: 1 }` reste `{ a: 1 }`).
+    if previous.kind == TokenKind::OpenBrace || current.kind == TokenKind::CloseBrace {
+        return current.space_before;
+    }
+
+    // Ternaire : `cond ? a : b` (le `:` d'une annotation reste collé : `x: int`).
+    if current.kind == TokenKind::Colon && colon_is_ternary(tokens, current_index) {
+        return true;
+    }
+
     // Les génériques restent compacts : `List<int>`, `Dict<str, int>`,
     // `Map<str, List<int>>`, etc. Les comparaisons restent espacées : `a < b`.
     if current_is_generic_angle(current, previous, next, current_index, tokens)
@@ -404,8 +580,27 @@ fn needs_space_between(
         return false;
     }
 
+    // `for x in [1, 2]`, `return [a]`, `if (a)`, `catch (e: Err)` : un mot-clé est
+    // séparé de `[` et `(` (contrairement à un appel `f(x)` ou une indexation `a[0]`).
+    if previous.kind == TokenKind::Word
+        && matches!(current.kind, TokenKind::OpenParen | TokenKind::OpenBracket)
+        && is_keyword_before_value(&previous.text)
+    {
+        return true;
+    }
+
     if current.kind == TokenKind::Operator {
-        return !is_unary_operator(tokens, current_index);
+        if is_unary_operator(tokens, current_index) {
+            // `= -5`, `* -2`, `, -1`, `return -x`, `&& !ok`, mais `!!x` et `(-1)`.
+            return match previous.kind {
+                TokenKind::Operator => !is_unary_operator(tokens, current_index - 1),
+                TokenKind::Comma | TokenKind::Colon => true,
+                TokenKind::Word => is_keyword_before_value(&previous.text),
+                _ => false,
+            };
+        }
+
+        return true;
     }
 
     // Aucun espace après l'ouverture d'un générique : `Dict<str, int>`.
@@ -439,6 +634,23 @@ fn needs_space_between(
     }
 }
 
+/// Mots-clés qui sont suivis d'une valeur ou d'une expression (et non d'un appel).
+fn is_keyword_before_value(text: &str) -> bool {
+    matches!(
+        text,
+        "in" | "return"
+            | "if"
+            | "while"
+            | "for"
+            | "match"
+            | "else"
+            | "is"
+            | "await"
+            | "throw"
+            | "catch"
+    )
+}
+
 fn is_unary_operator(tokens: &[Token], index: usize) -> bool {
     let token = match tokens.get(index) {
         Some(token) => token,
@@ -451,15 +663,17 @@ fn is_unary_operator(tokens: &[Token], index: usize) -> bool {
             let previous = index.checked_sub(1).and_then(|i| tokens.get(i));
             match previous {
                 None => true,
-                Some(previous) => matches!(
-                    previous.kind,
-                    TokenKind::Operator
-                        | TokenKind::OpenParen
-                        | TokenKind::OpenBracket
-                        | TokenKind::OpenBrace
-                        | TokenKind::Comma
-                        | TokenKind::Colon
-                ),
+                Some(previous) => {
+                    matches!(
+                        previous.kind,
+                        TokenKind::Operator
+                            | TokenKind::OpenParen
+                            | TokenKind::OpenBracket
+                            | TokenKind::OpenBrace
+                            | TokenKind::Comma
+                            | TokenKind::Colon
+                    ) || (previous.kind == TokenKind::Word && is_keyword_before_value(&previous.text))
+                }
             }
         }
         _ => false,
@@ -495,7 +709,8 @@ fn current_is_generic_angle(
     // Seuls les mots qui peuvent introduire un paramétrage de type ouvrent
     // ici un groupe générique. Cela permet notamment `Dict<str, int>` et
     // `List<int>` sans transformer `a < b` en `a<b`.
-    if !is_generic_head(previous.text.as_str()) {
+    if !is_generic_head(previous.text.as_str()) && !follows_declaration_keyword(current_index, tokens)
+    {
         return false;
     }
 
@@ -516,6 +731,52 @@ fn current_is_generic_angle(
                 ) =>
             {
                 return false;
+            }
+            _ => {}
+        }
+    }
+
+    false
+}
+
+/// `func plus_grand<T: Ord>(…)`, `class Boite<T>` : le mot placé avant `<` suit un
+/// mot-clé de déclaration, donc `<` ouvre des paramètres de type, même si le nom
+/// est en minuscules (fonctions en snake_case).
+fn follows_declaration_keyword(angle_index: usize, tokens: &[Token]) -> bool {
+    angle_index >= 2
+        && matches!(
+            tokens[angle_index - 2].text.as_str(),
+            "func" | "class" | "interface" | "enum" | "type"
+        )
+}
+
+/// `:` appartenant à un ternaire `cond ? a : b` (et non à une annotation
+/// `x: int` ni à une clé de record) : il prend un espace avant lui.
+fn colon_is_ternary(tokens: &[Token], colon_index: usize) -> bool {
+    let mut depth = 0usize;
+    let mut pending_colons = 0usize;
+
+    for index in (0..colon_index).rev() {
+        let token = &tokens[index];
+
+        match token.kind {
+            TokenKind::CloseParen | TokenKind::CloseBracket | TokenKind::CloseBrace => depth += 1,
+            TokenKind::OpenParen | TokenKind::OpenBracket | TokenKind::OpenBrace => {
+                if depth == 0 {
+                    return false;
+                }
+
+                depth -= 1;
+            }
+            _ if depth > 0 => {}
+            TokenKind::Comma | TokenKind::Semicolon => return false,
+            TokenKind::Colon => pending_colons += 1,
+            TokenKind::Operator if token.text == "?" => {
+                if pending_colons == 0 {
+                    return true;
+                }
+
+                pending_colons -= 1;
             }
             _ => {}
         }
@@ -636,11 +897,13 @@ fn is_declaration_start(line: &str) -> bool {
     matches!(
         (first, second),
         ("func", _)
+            | ("async", "func")
             | ("class", _)
             | ("interface", _)
             | ("enum", _)
             | ("type", _)
             | ("export", "func")
+            | ("export", "async")
             | ("export", "class")
             | ("export", "interface")
             | ("export", "enum")
@@ -777,6 +1040,100 @@ let z = a < b && b > c;
     }
 
     #[test]
+    fn keeps_generic_function_declarations_compact() {
+        let source = "func additionner<T:Add>(a:T,b:T)->T{\nreturn a+b;\n}\n\nfunc plus_grand<T: Ord>(a: T, b: T) -> T {\nreturn a > b ? a : b;\n}\n\nfunc somme<T:Add+Eq>(a:T,b:T)->T {\nif a == b {\nreturn a;\n}\nreturn a + b;\n}\n";
+
+        let formatted = format_source(source, 4, true);
+
+        for expected in [
+            "func additionner<T: Add>(a: T, b: T) -> T {",
+            "func plus_grand<T: Ord>(a: T, b: T) -> T {",
+            "func somme<T: Add + Eq>(a: T, b: T) -> T {",
+            "    return a > b ? a : b;",
+            "    if a == b {",
+        ] {
+            assert!(formatted.contains(expected), "manque `{expected}` dans :\n{formatted}");
+        }
+    }
+
+    #[test]
+    fn keeps_balanced_one_line_blocks_untouched() {
+        let source = "func f() {\n    if a == b {return a;}\n    let r = { a: 1 };\n}\n";
+
+        let formatted = format_source(source, 4, true);
+
+        assert_eq!(formatted, source);
+    }
+
+    #[test]
+    fn moves_stray_closing_brace_to_its_own_line() {
+        let source = "func f() {\n    if a == b {\n        return a;}\n}\n";
+
+        let formatted = format_source(source, 4, true);
+
+        assert_eq!(
+            formatted,
+            "func f() {\n    if a == b {\n        return a;\n    }\n}\n"
+        );
+    }
+
+    #[test]
+    fn moves_stray_closing_braces_around_else() {
+        let source = "func f() {\n    if a {\n        x();} else {\n        y();}\n}\n";
+
+        let formatted = format_source(source, 4, true);
+
+        assert_eq!(
+            formatted,
+            "func f() {\n    if a {\n        x();\n    } else {\n        y();\n    }\n}\n"
+        );
+    }
+
+    #[test]
+    fn ignores_braces_in_strings_and_comments() {
+        let source = "func f() {\n    let s = \"}\";\n    g(); // }\n}\n";
+
+        let formatted = format_source(source, 4, true);
+
+        assert_eq!(formatted, source);
+    }
+
+    #[test]
+    fn splits_stray_closing_brace_of_multiline_record() {
+        let source = "let r = {\n    a: 1,\n    b: 2};\n";
+
+        let formatted = format_source(source, 4, true);
+
+        assert_eq!(formatted, "let r = {\n    a: 1,\n    b: 2\n};\n");
+    }
+
+    #[test]
+    fn separates_keywords_from_brackets_and_parentheses() {
+        let source = "for item in[1,2,3,5]{}\nif(a){}\nreturn[1];\nreturn -x;\nlet l = items[0];\nlet n = f(1);\n";
+
+        let formatted = format_source(source, 4, true);
+
+        assert!(formatted.contains("for item in [1, 2, 3, 5] {}"), "{formatted}");
+        assert!(formatted.contains("if (a) {}"), "{formatted}");
+        assert!(formatted.contains("return [1];"), "{formatted}");
+        assert!(formatted.contains("return -x;"), "{formatted}");
+        assert!(formatted.contains("let l = items[0];"), "{formatted}");
+        assert!(formatted.contains("let n = f(1);"), "{formatted}");
+    }
+
+    #[test]
+    fn keeps_generic_class_and_ternary_spacing() {
+        let source = "class Boite<T> {\n}\nlet v = flag?1:2;\nlet w: int = flag ? 1 : 2;\nlet r = { a: 1 };\n";
+
+        let formatted = format_source(source, 4, true);
+
+        assert!(formatted.contains("class Boite<T> {"), "{formatted}");
+        assert!(formatted.contains("let v = flag ? 1 : 2;"), "{formatted}");
+        assert!(formatted.contains("let w: int = flag ? 1 : 2;"), "{formatted}");
+        assert!(formatted.contains("let r = { a: 1 };"), "{formatted}");
+    }
+
+    #[test]
     fn keeps_generic_types_compact() {
         let source = "let values:List<int|float>=[];\n";
 
@@ -846,7 +1203,7 @@ let z = a < b && b > c;
 
         assert_eq!(
             formatted,
-            "func a() { return 1; }\n\nfunc b() { return 2; }\n\nclass Point {}\n"
+            "func a() {return 1;}\n\nfunc b() {return 2;}\n\nclass Point {}\n"
         );
     }
 

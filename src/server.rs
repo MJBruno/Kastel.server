@@ -118,6 +118,12 @@ impl Server {
                 }
             }
 
+            "textDocument/codeAction" => {
+                if let Some(message) = self.code_action(request.id, request.params) {
+                    messages.push(message);
+                }
+            }
+
             "textDocument/prepareRename" => {
                 if let Some(message) = self.prepare_rename(request.id, request.params) {
                     messages.push(message);
@@ -203,6 +209,10 @@ impl Server {
                     },
                     "renameProvider": {
                         "prepareProvider": true
+                    },
+                    "codeActionProvider": {
+                        "codeActionKinds": ["refactor.generate", "source.generate"],
+                        "resolveProvider": false
                     }
                 }
             }),
@@ -360,7 +370,7 @@ impl Server {
         let Some(current_file) = uri_to_path(uri) else {
             return;
         };
-        let Some(module_path) = resolver.resolve(&current_file, parts) else {
+        let Some(module_path) = resolver.resolve_file(&current_file, parts) else {
             eprintln!("Module not found: {}", parts.join("."));
             return;
         };
@@ -582,6 +592,36 @@ impl Server {
             id,
             result.unwrap_or(Value::Null),
         )))
+    }
+
+    /// `textDocument/codeAction` : génération de Getter / Setter /
+    /// Constructeur / méthodes d'interface (voir `code_actions.rs`).
+    fn code_action(&self, id: Option<Value>, params: Option<Value>) -> Option<ServerMessage> {
+        let id = id?;
+        let params = params?;
+
+        let uri = params.get("textDocument")?.get("uri")?.as_str()?;
+        let start = params.get("range")?.get("start")?;
+        let line = start.get("line")?.as_u64()? as u32;
+        let character = start.get("character")?.as_u64()? as u32;
+
+        let only: Vec<String> = params
+            .get("context")
+            .and_then(|context| context.get("only"))
+            .and_then(Value::as_array)
+            .map(|kinds| {
+                kinds
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(str::to_string)
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        let result =
+            crate::code_actions::build_code_actions(&self.workspace, uri, line, character, &only);
+
+        Some(ServerMessage::Response(RpcResponse::new(id, result)))
     }
 
     fn formatting(&self, id: Option<Value>, params: Option<Value>) -> Option<ServerMessage> {

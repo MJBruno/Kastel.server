@@ -41,6 +41,8 @@ pub const KEYWORDS: &[&str] = &[
     "catch",
     "throw",
     "finally",
+    "async",
+    "await",
     "is",
 ];
 
@@ -66,10 +68,34 @@ pub const TYPE_NAMES: &[&str] = &[
     "Mutex",
     "Semaphore",
     "WaitGroup",
+    "Barrier",
+    "RwLock",
+    "Event",
+    "Condvar",
+    // Handles réseau.
+    "TcpStream",
+    "TcpListener",
+    "UdpSocket",
     "Iterator",
     "Iterable",
     // Type du contrat implémenté, valide dans une `interface`.
     "Self",
+    // Capabilities du langage (contraintes génériques `<T: Add + Eq>`,
+    // surcharge d'opérateurs). Intégrées au core : jamais « non définies ».
+    "Add",
+    "Sub",
+    "Mul",
+    "Div",
+    "Mod",
+    "BitAnd",
+    "BitOr",
+    "BitXor",
+    "ShiftLeft",
+    "ShiftRight",
+    "Eq",
+    "Ord",
+    "Index",
+    "IndexMut",
 ];
 
 /// Mots contextuels utilisés par les membres de classe et les alias.
@@ -318,6 +344,81 @@ pub const BUILTIN_FUNCTIONS: &[(&str, &str, &str)] = &[
         "wait_group() -> WaitGroup",
         "Crée un WaitGroup pour attendre un groupe de tâches.",
     ),
+    (
+        "barrier",
+        "barrier(parties) -> Barrier",
+        "Crée une barrière : `wait()` bloque jusqu'à ce que `parties` tâches soient arrivées.",
+    ),
+    (
+        "rwlock",
+        "rwlock() -> RwLock",
+        "Crée un verrou lecteurs/écrivain.",
+    ),
+    (
+        "event",
+        "event() -> Event",
+        "Crée un événement : `wait()` attend qu'un autre appelant fasse `set()`.",
+    ),
+    (
+        "condvar",
+        "condvar(mutex) -> Condvar",
+        "Crée une variable de condition associée à un Mutex.",
+    ),
+    (
+        "http_get",
+        "http_get(url) -> { status, headers, body, version, reason }",
+        "Requête HTTP/1.1 GET (http:// uniquement). `body` est une List<int>.",
+    ),
+    (
+        "http_request",
+        "http_request(method, url, headers, body) -> { status, headers, body, version, reason }",
+        "Requête HTTP/1.1 avec méthode, en-têtes (Dict<str, str>) et corps.",
+    ),
+    (
+        "regex_is_match",
+        "regex_is_match(pattern, text) -> Result<bool, str>",
+        "Teste si le motif correspond quelque part dans le texte.",
+    ),
+    (
+        "regex_find",
+        "regex_find(pattern, text) -> Result<Option<{ start, end, text, groups }>, str>",
+        "Première correspondance du motif, ou None.",
+    ),
+    (
+        "regex_find_all",
+        "regex_find_all(pattern, text) -> Result<List<{ start, end, text, groups }>, str>",
+        "Toutes les correspondances du motif.",
+    ),
+    (
+        "regex_replace",
+        "regex_replace(pattern, text, replacement) -> Result<str, str>",
+        "Remplace les correspondances du motif.",
+    ),
+    (
+        "regex_split",
+        "regex_split(pattern, text) -> Result<List<str>, str>",
+        "Découpe le texte selon le motif.",
+    ),
+    (
+        "regex_escape",
+        "regex_escape(text) -> str",
+        "Échappe les caractères spéciaux d'une regex.",
+    ),
+    (
+        "tcp_connect",
+        "tcp_connect(host, port) -> TcpStream",
+        "Ouvre une connexion TCP. Sockets non bloquants : `read()` renvoie None sans donnée.",
+    ),
+    (
+        "tcp_listen",
+        "tcp_listen(host, port) -> TcpListener",
+        "Écoute les connexions TCP ; `accept()` renvoie None sans client en attente.",
+    ),
+    (
+        "udp_bind",
+        "udp_bind(host, port) -> UdpSocket",
+        "Ouvre un socket UDP ; `recv_from()` renvoie None sans datagramme.",
+    ),
 ];
 
 /// Noms reconnus par l'analyse sémantique comme builtins.
@@ -399,6 +500,21 @@ pub const BUILTINS: &[&str] = &[
     "mutex",
     "semaphore",
     "wait_group",
+    "barrier",
+    "rwlock",
+    "event",
+    "condvar",
+    "http_get",
+    "http_request",
+    "regex_is_match",
+    "regex_find",
+    "regex_find_all",
+    "regex_replace",
+    "regex_split",
+    "regex_escape",
+    "tcp_connect",
+    "tcp_listen",
+    "udp_bind",
 ];
 
 /// Méthodes du conteneur syntaxique `List<T>`.
@@ -494,6 +610,7 @@ pub const LIST_METHODS: &[(&str, &str, &str)] = &[
 /// Méthodes réelles de `str`.
 pub const STRING_METHODS: &[(&str, &str, &str)] = &[
     ("size", "value.size() -> int", "Nombre de caractères."),
+    ("copy", "value.copy() -> str", "Renvoie une copie de la chaîne."),
     (
         "is_empty",
         "value.is_empty() -> bool",
@@ -1113,6 +1230,249 @@ pub const RECORD_METHODS: &[(&str, &str, &str)] = &[
     ),
 ];
 
+/// Méthodes de `Barrier`.
+pub const BARRIER_METHODS: &[(&str, &str, &str)] = &[
+    (
+        "wait",
+        "value.wait()",
+        "Attend que toutes les parties soient arrivées.",
+    ),
+    (
+        "parties",
+        "value.parties() -> int",
+        "Nombre de parties attendues.",
+    ),
+    (
+        "arrived",
+        "value.arrived() -> int",
+        "Nombre de parties déjà arrivées.",
+    ),
+    (
+        "generation",
+        "value.generation() -> int",
+        "Numéro de génération courant.",
+    ),
+    (
+        "is_broken",
+        "value.is_broken() -> bool",
+        "Indique si la barrière est brisée.",
+    ),
+];
+
+/// Méthodes de `RwLock`.
+pub const RWLOCK_METHODS: &[(&str, &str, &str)] = &[
+    (
+        "read_lock",
+        "value.read_lock()",
+        "Prend le verrou en lecture.",
+    ),
+    (
+        "write_lock",
+        "value.write_lock()",
+        "Prend le verrou en écriture.",
+    ),
+    (
+        "read_unlock",
+        "value.read_unlock()",
+        "Libère un verrou de lecture.",
+    ),
+    (
+        "write_unlock",
+        "value.write_unlock()",
+        "Libère le verrou d'écriture.",
+    ),
+    (
+        "try_read_lock",
+        "value.try_read_lock() -> bool",
+        "Tente de prendre le verrou en lecture sans attendre.",
+    ),
+    (
+        "try_write_lock",
+        "value.try_write_lock() -> bool",
+        "Tente de prendre le verrou en écriture sans attendre.",
+    ),
+    (
+        "is_read_locked",
+        "value.is_read_locked() -> bool",
+        "Indique si des lecteurs détiennent le verrou.",
+    ),
+    (
+        "is_write_locked",
+        "value.is_write_locked() -> bool",
+        "Indique si un écrivain détient le verrou.",
+    ),
+    (
+        "reader_count",
+        "value.reader_count() -> int",
+        "Nombre de lecteurs actifs.",
+    ),
+];
+
+/// Méthodes de `Event`.
+pub const EVENT_METHODS: &[(&str, &str, &str)] = &[
+    (
+        "wait",
+        "value.wait()",
+        "Attend que l'événement soit déclenché.",
+    ),
+    (
+        "set",
+        "value.set()",
+        "Déclenche l'événement.",
+    ),
+    (
+        "reset",
+        "value.reset()",
+        "Remet l'événement à zéro.",
+    ),
+    (
+        "is_set",
+        "value.is_set() -> bool",
+        "Indique si l'événement est déclenché.",
+    ),
+];
+
+/// Méthodes de `Condvar`.
+pub const CONDVAR_METHODS: &[(&str, &str, &str)] = &[
+    (
+        "wait",
+        "value.wait()",
+        "Attend une notification (libère le Mutex associé).",
+    ),
+    (
+        "notify_one",
+        "value.notify_one()",
+        "Réveille une tâche en attente.",
+    ),
+    (
+        "notify_all",
+        "value.notify_all()",
+        "Réveille toutes les tâches en attente.",
+    ),
+    (
+        "waiter_count",
+        "value.waiter_count() -> int",
+        "Nombre de tâches en attente.",
+    ),
+];
+
+/// Méthodes de `TcpStream` (sockets non bloquants).
+pub const TCP_STREAM_METHODS: &[(&str, &str, &str)] = &[
+    (
+        "read",
+        "value.read(size) -> Option<List<int>>",
+        "Lit jusqu'à `size` octets ; None si aucune donnée n'est disponible.",
+    ),
+    (
+        "write",
+        "value.write(bytes) -> int",
+        "Écrit des octets ; renvoie le nombre d'octets écrits.",
+    ),
+    (
+        "shutdown",
+        "value.shutdown(mode)",
+        "Ferme une direction : \"read\", \"write\" ou \"both\".",
+    ),
+    (
+        "set_nodelay",
+        "value.set_nodelay(enabled)",
+        "Active ou désactive TCP_NODELAY.",
+    ),
+    (
+        "nodelay",
+        "value.nodelay() -> bool",
+        "Indique si TCP_NODELAY est actif.",
+    ),
+    (
+        "local_addr",
+        "value.local_addr() -> str",
+        "Adresse locale (ip:port).",
+    ),
+    (
+        "peer_addr",
+        "value.peer_addr() -> str",
+        "Adresse du pair (ip:port).",
+    ),
+    (
+        "is_closed",
+        "value.is_closed() -> bool",
+        "Indique si le socket est fermé.",
+    ),
+    (
+        "close",
+        "value.close()",
+        "Ferme le socket.",
+    ),
+];
+
+/// Méthodes de `TcpListener`.
+pub const TCP_LISTENER_METHODS: &[(&str, &str, &str)] = &[
+    (
+        "accept",
+        "value.accept() -> Option<TcpStream>",
+        "Accepte une connexion ; None si aucun client n'attend.",
+    ),
+    (
+        "local_addr",
+        "value.local_addr() -> str",
+        "Adresse d'écoute (ip:port).",
+    ),
+    (
+        "is_closed",
+        "value.is_closed() -> bool",
+        "Indique si le socket est fermé.",
+    ),
+    (
+        "close",
+        "value.close()",
+        "Ferme le socket.",
+    ),
+];
+
+/// Méthodes de `UdpSocket`.
+pub const UDP_SOCKET_METHODS: &[(&str, &str, &str)] = &[
+    (
+        "send_to",
+        "value.send_to(bytes, host, port) -> int",
+        "Envoie un datagramme à host:port.",
+    ),
+    (
+        "recv_from",
+        "value.recv_from(size) -> Option<(List<int>, str, int)>",
+        "Reçoit un datagramme (octets, hôte, port) ; None si aucun.",
+    ),
+    (
+        "connect",
+        "value.connect(host, port)",
+        "Associe le socket à un pair par défaut.",
+    ),
+    (
+        "send",
+        "value.send(bytes) -> int",
+        "Envoie au pair par défaut.",
+    ),
+    (
+        "local_addr",
+        "value.local_addr() -> str",
+        "Adresse locale (ip:port).",
+    ),
+    (
+        "peer_addr",
+        "value.peer_addr() -> str",
+        "Adresse du pair (ip:port).",
+    ),
+    (
+        "is_closed",
+        "value.is_closed() -> bool",
+        "Indique si le socket est fermé.",
+    ),
+    (
+        "close",
+        "value.close()",
+        "Ferme le socket.",
+    ),
+];
+
 /// Table de méthodes intégrées associée à un type statique, s'il en existe une.
 ///
 /// Un `Type::Named` correspondant à un handle du runtime (`Mutex`,
@@ -1146,6 +1506,13 @@ pub fn builtin_handle_table(name: &str) -> Option<&'static [(&'static str, &'sta
         "mutex" => Some(MUTEX_METHODS),
         "semaphore" => Some(SEMAPHORE_METHODS),
         "waitgroup" => Some(WAIT_GROUP_METHODS),
+        "barrier" => Some(BARRIER_METHODS),
+        "rwlock" => Some(RWLOCK_METHODS),
+        "event" => Some(EVENT_METHODS),
+        "condvar" => Some(CONDVAR_METHODS),
+        "tcpstream" => Some(TCP_STREAM_METHODS),
+        "tcplistener" => Some(TCP_LISTENER_METHODS),
+        "udpsocket" => Some(UDP_SOCKET_METHODS),
         "iterator" => Some(ITERATOR_METHODS),
         _ => None,
     }
@@ -1351,6 +1718,64 @@ mod tests {
                     "`{removed}` a été supprimé de l'API standard"
                 );
             }
+        }
+    }
+
+    /// Barrier / RwLock / Event / Condvar : les tables du LSP et les signatures du
+    /// vérificateur de types doivent coïncider dans les deux sens.
+    #[test]
+    fn synchronization_handle_tables_match_the_type_checker() {
+        type Probe = fn(&Type, &str) -> Option<Type>;
+
+        let cases: [(&str, Table, Probe); 4] = [
+            ("Barrier", BARRIER_METHODS, |ty, name| ty.barrier_member_type(name)),
+            ("RwLock", RWLOCK_METHODS, |ty, name| ty.rwlock_member_type(name)),
+            ("Event", EVENT_METHODS, |ty, name| ty.event_member_type(name)),
+            ("Condvar", CONDVAR_METHODS, |ty, name| ty.condvar_member_type(name)),
+        ];
+        let candidates: Vec<&str> = cases
+            .iter()
+            .flat_map(|(_, table, _)| table.iter().map(|(name, _, _)| *name))
+            .collect();
+
+        for (type_name, table, probe) in cases {
+            let ty = Type::Named(type_name.into());
+
+            for (name, _, _) in table {
+                assert!(probe(&ty, name).is_some(), "{type_name}.{name} inconnu du type checker");
+            }
+
+            for name in &candidates {
+                if probe(&ty, name).is_some() {
+                    assert!(
+                        table.iter().any(|(n, _, _)| n == name),
+                        "{type_name}.{name} connu du type checker mais absent de la table LSP"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn network_handles_have_member_tables() {
+        for name in ["TcpStream", "TcpListener", "UdpSocket"] {
+            assert!(member_table(&Type::Named(name.into())).is_some(), "{name}");
+            assert!(TYPE_NAMES.contains(&name), "{name} absent de TYPE_NAMES");
+        }
+
+        for name in [
+            "tcp_connect",
+            "tcp_listen",
+            "udp_bind",
+            "http_get",
+            "http_request",
+            "regex_find",
+            "barrier",
+            "rwlock",
+            "event",
+            "condvar",
+        ] {
+            assert!(BUILTINS.contains(&name), "{name} absent de BUILTINS");
         }
     }
 

@@ -228,6 +228,7 @@ impl SymbolIndex {
                 params,
                 param_types,
                 return_type,
+                is_async,
                 ..
             } => {
                 let signature = function_signature(
@@ -236,6 +237,7 @@ impl SymbolIndex {
                     params,
                     param_types,
                     return_type,
+                    *is_async,
                 );
                 self.insert(
                     name.clone(),
@@ -413,6 +415,31 @@ fn type_expr_display(expr: &TypeExpr) -> String {
                 .collect::<Vec<_>>()
                 .join(", ")
         ),
+        // `(int, str)`, `()` ; un tuple à un élément s'écrit `(int,)`.
+        TypeExpr::Tuple(items) if items.len() == 1 => {
+            format!("({},)", type_expr_display(&items[0]))
+        }
+        TypeExpr::Tuple(items) => format!(
+            "({})",
+            items
+                .iter()
+                .map(type_expr_display)
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+        // `func(int, str) -> bool`
+        TypeExpr::Function {
+            params,
+            return_type,
+        } => format!(
+            "func({}) -> {}",
+            params
+                .iter()
+                .map(type_expr_display)
+                .collect::<Vec<_>>()
+                .join(", "),
+            type_expr_display(return_type)
+        ),
     }
 }
 
@@ -422,6 +449,7 @@ fn function_signature(
     params: &[String],
     param_types: &[Option<TypeExpr>],
     return_type: &Option<TypeExpr>,
+    is_async: bool,
 ) -> String {
     let args = params
         .iter()
@@ -443,7 +471,8 @@ fn function_signature(
         .map(type_expr_display)
         .unwrap_or_else(|| "dynamic".to_string());
     format!(
-        "func {}{}({}) -> {}",
+        "{}func {}{}({}) -> {}",
+        if is_async { "async " } else { "" },
         name,
         generic_params_display(generic_params),
         args,

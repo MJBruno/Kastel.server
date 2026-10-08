@@ -6,8 +6,48 @@
 //! même comportement que le compilateur/VM.
 
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 
 use kastel::module::resolver::{ImportResolution, ModuleResolver as KastelResolver};
+
+/// Localise la bibliothèque standard `std/` pour le LSP.
+///
+/// Le resolver de `kastel` cherche `std` à côté de l'exécutable courant, puis dans
+/// `CARGO_MANIFEST_DIR` — un chemin figé à la compilation qui n'existe que sur la
+/// machine du développeur. Le LSP est installé ailleurs (extension VS Code), il
+/// teste donc, dans l'ordre :
+///
+///   1. `KASTEL_STD_PATH` (positionnée par l'extension Forge) ;
+///   2. `<dossier du LSP>/std`, `<dossier du LSP>/../std`, `<dossier du LSP>/../../std`
+///      (ce dernier : `<extension>/server/<os>-<arch>/kastel-lsp` → `<extension>/std`).
+///
+/// `None` laisse le comportement par défaut de `kastel`. Résultat mis en cache.
+fn locate_std_root() -> Option<PathBuf> {
+    static STD_ROOT: OnceLock<Option<PathBuf>> = OnceLock::new();
+
+    STD_ROOT
+        .get_or_init(|| {
+            if let Ok(custom) = std::env::var("KASTEL_STD_PATH") {
+                let path = PathBuf::from(custom);
+
+                if path.is_dir() {
+                    return Some(path);
+                }
+            }
+
+            let exe = std::env::current_exe().ok()?;
+            let dir = exe.parent()?.to_path_buf();
+
+            [
+                dir.join("std"),
+                dir.join("..").join("std"),
+                dir.join("..").join("..").join("std"),
+            ]
+            .into_iter()
+            .find(|candidate| candidate.is_dir())
+        })
+        .clone()
+}
 
 #[derive(Debug, Clone)]
 pub struct ModuleResolver {
@@ -19,15 +59,30 @@ impl ModuleResolver {
         let root =
             root.unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
 
-        Self {
-            inner: KastelResolver::new(root),
-        }
+        let inner = KastelResolver::new(root);
+
+        let inner = match locate_std_root() {
+            Some(std_root) => inner.with_std_root(std_root),
+            None => inner,
+        };
+
+        Self { inner }
     }
 
 
     /// Résout uniquement un module fichier.
     pub fn resolve(&self, current_file: &Path, parts: &[String]) -> Option<PathBuf> {
         self.inner.resolve(current_file, parts).ok()
+    }
+
+    /// Fichier du module désigné par `parts`, y compris pour `import module.export`
+    /// (le fichier du module est alors celui qui contient l'export).
+    pub fn resolve_file(&self, current_file: &Path, parts: &[String]) -> Option<PathBuf> {
+        match self.inner.resolve_import(current_file, parts).ok()? {
+            ImportResolution::Module(path) | ImportResolution::Export { module: path, .. } => {
+                Some(path)
+            }
+        }
     }
 
     /// Résout la forme complète `module` / `module.export` utilisée par

@@ -468,21 +468,21 @@ mod tests {
 
     #[test]
     fn finds_member_declaration() {
-        let source = r#"class Person {\n    private let name: str = \"Bruno\";\n    func greet() -> str {\n        return name;\n    }\n}\n"#;
+        let source = "class Person {\n    private let name: str = \"Bruno\";\n    func greet() -> str {\n        return name;\n    }\n}\n";
         let span = find_member_declaration_span(source, "Person", "greet").unwrap();
         assert_eq!(&source[span.0..span.1], "greet");
     }
 
     #[test]
     fn finds_private_field_declaration() {
-        let source = r#"class Person {\n    private let name: str = \"Bruno\";\n}\n"#;
+        let source = "class Person {\n    private let name: str = \"Bruno\";\n}\n";
         let span = find_member_declaration_span(source, "Person", "name").unwrap();
         assert_eq!(&source[span.0..span.1], "name");
     }
 
     #[test]
     fn finds_interface_method_declaration() {
-        let source = r#"interface Named {\n    func name() -> str;\n}\n"#;
+        let source = "interface Named {\n    func name() -> str;\n}\n";
         let span = find_member_declaration_span(source, "Named", "name").unwrap();
         assert_eq!(&source[span.0..span.1], "name");
     }

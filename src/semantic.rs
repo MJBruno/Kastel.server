@@ -73,7 +73,7 @@ pub fn analyze(workspace: &Workspace, uri: &str) -> Vec<Diagnostic> {
     let (mut scopes, brace_scopes) = build_scopes(&masked);
     let mut bindings = Vec::new();
 
-    collect_local_declarations(&tokens, &brace_scopes, &mut scopes);
+    collect_local_declarations(&masked, &tokens, &brace_scopes, &mut scopes);
 
     collect_function_parameter_bindings(&masked, &tokens, &scopes, &mut bindings);
     collect_fat_arrow_bindings(&masked, &mut bindings);
@@ -227,7 +227,7 @@ fn is_declaration_name(source: &str, offset: usize) -> bool {
     }
     matches!(
         previous,
-        Some("func" | "class" | "interface" | "enum" | "type" | "let" | "const")
+        Some("func" | "class" | "interface" | "enum" | "type" | "let" | "const" | "catch")
     )
 }
 
@@ -309,6 +309,7 @@ fn build_scopes(source: &str) -> (Vec<Scope>, HashMap<usize, usize>) {
 }
 
 fn collect_local_declarations(
+    source: &str,
     tokens: &[LexToken],
     brace_scopes: &HashMap<usize, usize>,
     scopes: &mut [Scope],
@@ -332,7 +333,7 @@ fn collect_local_declarations(
             }
 
             "for" => {
-                collect_for_variable(tokens, index, brace_scopes, scopes);
+                collect_for_variable(source, tokens, index, brace_scopes, scopes);
             }
 
             "catch" => {
@@ -875,42 +876,91 @@ fn find_next_open_brace(source: &str, start: usize) -> Option<usize> {
         .map(|relative| start + relative)
 }
 
+/// Déclare les variables liées par le pattern d'un `for`.
+///
+/// Le parser Kastel accepte n'importe quel pattern irréfutable après `for` :
+///
+/// ```text
+/// for x in items { }
+/// for (x, y) in items { }          // destructuration de tuple
+/// for (i, (a, b)) in pairs { }     // tuples imbriqués
+/// for [a, b] in rows { }           // liste
+/// for (_, value) in entries { }    // `_` ignoré
+/// ```
+///
+/// Toutes les variables du pattern sont visibles dans le corps de la boucle
+/// (et ses blocs imbriqués). Le `in` recherché est le premier `in` situé hors
+/// de toute parenthèse / crochet.
 fn collect_for_variable(
+    source: &str,
     tokens: &[LexToken],
     for_index: usize,
     brace_scopes: &HashMap<usize, usize>,
     scopes: &mut [Scope],
 ) {
-    let Some(variable_index) = next_identifier_index(tokens, for_index + 1) else {
+    let Some(in_index) = find_for_in_index(tokens, for_index) else {
         return;
     };
 
-    let Some(variable) = token_identifier(tokens, variable_index) else {
-        return;
-    };
+    // `for` = 3 octets ASCII.
+    let pattern_start = tokens[for_index].start + 3;
+    let pattern_end = tokens[in_index].start;
 
-    let Some(in_index) = next_identifier_index(tokens, variable_index + 1) else {
-        return;
-    };
-
-    if token_identifier(tokens, in_index) != Some("in") {
+    if pattern_start >= pattern_end || pattern_end > source.len() {
         return;
     }
 
-    // La variable est visible dans le corps de la boucle et dans ses blocs
-    // imbriqués. On la place dans le scope contenant la boucle.
-    let scope = innermost_scope_at(scopes, tokens[for_index].start);
-    scopes[scope].names.insert(variable.to_string());
+    let names = pattern_binding_names(source, pattern_start, pattern_end);
 
-    // Si possible, le corps reçoit également le nom pour les sources où la
+    if names.is_empty() {
+        return;
+    }
+
+    // Les variables sont visibles dans le corps de la boucle et dans ses
+    // blocs imbriqués. On les place dans le scope contenant la boucle.
+    let scope = innermost_scope_at(scopes, tokens[for_index].start);
+    for name in &names {
+        scopes[scope].names.insert(name.name.clone());
+    }
+
+    // Si possible, le corps reçoit également les noms pour les sources où la
     // résolution démarre directement à l'intérieur du bloc de boucle.
     let Some(open_brace) = next_punctuation_index(tokens, in_index + 1, b'{') else {
         return;
     };
 
     if let Some(&body_scope) = brace_scopes.get(&tokens[open_brace].start) {
-        scopes[body_scope].names.insert(variable.to_string());
+        for name in &names {
+            scopes[body_scope].names.insert(name.name.clone());
+        }
     }
+}
+
+/// Index du `in` qui termine le pattern d'un `for`, ou `None` si la boucle
+/// est mal formée (accolade ou `;` rencontrés avant le `in`).
+fn find_for_in_index(tokens: &[LexToken], for_index: usize) -> Option<usize> {
+    let mut depth = 0usize;
+    let mut index = for_index + 1;
+
+    while index < tokens.len() {
+        match &tokens[index].kind {
+            LexTokenKind::Punctuation(b'(') | LexTokenKind::Punctuation(b'[') => depth += 1,
+            LexTokenKind::Punctuation(b')') | LexTokenKind::Punctuation(b']') => {
+                depth = depth.checked_sub(1)?;
+            }
+            LexTokenKind::Punctuation(b'{')
+            | LexTokenKind::Punctuation(b'}')
+            | LexTokenKind::Punctuation(b';') => return None,
+            LexTokenKind::Identifier(name) if depth == 0 && name == "in" => {
+                return Some(index);
+            }
+            _ => {}
+        }
+
+        index += 1;
+    }
+
+    None
 }
 
 fn collect_catch_parameter(
@@ -990,6 +1040,38 @@ fn brace_depth_at(source: &str, offset: usize) -> usize {
         })
 }
 
+/// Fin (offset) du littéral numérique qui commence à `start` (un chiffre) :
+/// `100_000_000`, `0xFF`, `0b1010`, `3.14`, `1e5`, `2.5e-3`. Sans cela, `_000_000`,
+/// `xFF` ou `e5` seraient pris pour des identifiants non définis.
+fn numeric_literal_end(bytes: &[u8], start: usize) -> usize {
+    let hexadecimal = bytes[start] == b'0' && matches!(bytes.get(start + 1), Some(b'x' | b'X'));
+    let mut index = start;
+
+    while index < bytes.len() {
+        let byte = bytes[index];
+        let next_is_digit = bytes
+            .get(index + 1)
+            .is_some_and(|next| next.is_ascii_digit());
+
+        if byte.is_ascii_alphanumeric() || byte == b'_' {
+            index += 1;
+        } else if byte == b'.' && next_is_digit {
+            index += 1;
+        } else if (byte == b'+' || byte == b'-')
+            && !hexadecimal
+            && index > start
+            && matches!(bytes[index - 1], b'e' | b'E')
+            && next_is_digit
+        {
+            index += 1;
+        } else {
+            break;
+        }
+    }
+
+    index
+}
+
 fn scan_tokens(source: &str) -> Vec<LexToken> {
     let bytes = source.as_bytes();
     let mut tokens = Vec::new();
@@ -1013,6 +1095,11 @@ fn scan_tokens(source: &str) -> Vec<LexToken> {
                 start,
             });
 
+            continue;
+        }
+
+        if bytes[index].is_ascii_digit() {
+            index = numeric_literal_end(bytes, index);
             continue;
         }
 
@@ -1054,6 +1141,8 @@ fn scan_identifiers(source: &str) -> Vec<Ident> {
                 name,
                 offset: start,
             });
+        } else if bytes[index].is_ascii_digit() {
+            index = numeric_literal_end(bytes, index);
         } else {
             index += 1;
         }
@@ -1277,6 +1366,44 @@ println(hidden);
     }
 
     #[test]
+    fn allows_catch_parameter_declaration() {
+        let workspace = workspace_with("try {\n    \n} catch (e) {\n    \n} finally {\n    \n}\n");
+        let diagnostics = analyze(&workspace, "file:///main.ks");
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+    }
+
+    #[test]
+    fn catch_parameter_is_usable_in_its_block() {
+        let workspace = workspace_with(
+            "try {\n    throw 1;\n} catch (e: Err) {\n    println(e);\n} finally {\n}\n",
+        );
+        let diagnostics = analyze(&workspace, "file:///main.ks");
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+
+        let workspace = workspace_with("try {\n} catch (e) {\n}\nprintln(e);\n");
+        let diagnostics = analyze(&workspace, "file:///main.ks");
+        assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
+    }
+
+    #[test]
+    fn ignores_numeric_literals() {
+        let workspace = workspace_with(
+            "let a = 100_000_000;\nlet b = 0xFF;\nlet c = 0b1010_0101;\nlet d = 1e5;\nlet f = 2.5e-3;\nlet g = 1_000.5;\nlet h = 1..5;\nlet i = 0..=9;\n",
+        );
+        let diagnostics = analyze(&workspace, "file:///main.ks");
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+    }
+
+    #[test]
+    fn allows_network_and_regex_builtins() {
+        let workspace = workspace_with(
+            "let s = tcp_connect(\"127.0.0.1\", 80);\nlet l = tcp_listen(\"0.0.0.0\", 8080);\nlet u = udp_bind(\"0.0.0.0\", 9000);\nlet r = http_get(\"http://localhost/\");\nlet q = http_request(\"POST\", \"http://localhost/\", dict(), None);\nlet m = regex_is_match(\"a+\", \"aaa\");\nlet b = barrier(2);\nlet w = rwlock();\nlet e = event();\nlet c = condvar(mutex());\n",
+        );
+        let diagnostics = analyze(&workspace, "file:///main.ks");
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+    }
+
+    #[test]
     fn ignores_string_contents() {
         let workspace = workspace_with("let x = \"val\"\n");
         let diagnostics = analyze(&workspace, "file:///main.ks");
@@ -1334,7 +1461,11 @@ println(hidden);
     #[test]
     fn allows_concurrency_and_result_builtins() {
         assert_no_diagnostics(
-            r#"let ch = channel(4);
+            r#"func work(n) {
+    return n;
+}
+
+let ch = channel(4);
 let lock = mutex();
 let group = wait_group();
 let handle = spawn(work, 1);
@@ -1483,5 +1614,73 @@ func nom(c) {
 }
 "#,
         );
+    }
+
+    #[test]
+    fn for_single_variable_is_declared() {
+        let source = r#"let items = [1, 2, 3];
+for x in items {
+    println(x);
+}
+"#;
+        let workspace = workspace_with(source);
+        let diagnostics = analyze(&workspace, "file:///main.ks");
+        assert!(
+            diagnostics.is_empty(),
+            "unexpected diagnostics: {:?}",
+            diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn for_tuple_pattern_declares_every_variable() {
+        let source = r#"let items = [(1, "a"), (2, "b")];
+for (x, y) in items {
+    println(x);
+    println(y);
+}
+"#;
+        let workspace = workspace_with(source);
+        let diagnostics = analyze(&workspace, "file:///main.ks");
+        assert!(
+            diagnostics.is_empty(),
+            "unexpected diagnostics: {:?}",
+            diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn for_nested_tuple_and_wildcard_patterns() {
+        let source = r#"let pairs = [(0, (1, 2))];
+for (i, (a, b)) in pairs {
+    println(i + a + b);
+}
+for (_, v) in pairs {
+    println(v);
+}
+for [p, q] in [[1, 2]] {
+    println(p + q);
+}
+"#;
+        let workspace = workspace_with(source);
+        let diagnostics = analyze(&workspace, "file:///main.ks");
+        assert!(
+            diagnostics.is_empty(),
+            "unexpected diagnostics: {:?}",
+            diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn for_tuple_pattern_does_not_hide_real_undefined_identifiers() {
+        let source = r#"let items = [(1, 2)];
+for (x, y) in items {
+    println(z);
+}
+"#;
+        let workspace = workspace_with(source);
+        let diagnostics = analyze(&workspace, "file:///main.ks");
+        assert_eq!(diagnostics.len(), 1);
+        assert!(diagnostics[0].message.contains('z'));
     }
 }
