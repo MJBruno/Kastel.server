@@ -251,6 +251,25 @@ fn add_type_members(
                 seen,
             );
         }
+        // Classe importée depuis un autre module : seulement si elle est
+        // exportée, et seuls ses membres `public` sont proposés.
+        Type::Named(class_name)
+        | Type::Generic {
+            name: class_name, ..
+        } if imported_class_index(workspace, uri, document, class_name).is_some() => {
+            if let Some(classes) = imported_class_index(workspace, uri, document, class_name) {
+                add_class_members(
+                    classes,
+                    class_name,
+                    None,
+                    false,
+                    receiver_path == class_name.as_str(),
+                    prefix,
+                    items,
+                    seen,
+                );
+            }
+        }
         Type::Module(module_path) => {
             let Some(current_file) = uri_to_path(uri) else {
                 return;
@@ -320,7 +339,14 @@ pub(crate) fn infer_receiver_types(
             for segment in receiver_path.split('.').skip(1) {
                 let mut next = Vec::new();
                 for ty in current {
-                    next.extend(member_result_types(workspace, uri, document, &ty, segment));
+                    next.extend(member_result_types(
+                        workspace,
+                        uri,
+                        document,
+                        &ty,
+                        segment,
+                        first == "self",
+                    ));
                 }
                 current = next;
             }
@@ -631,25 +657,120 @@ fn split_generic_arguments(text: &str) -> Vec<String> {
     parts
 }
 
+/// Classe déclarée par un module importé et EXPORTÉE : retourne l'URI et le
+/// document du module qui la définit. Seules les classes exportées sont
+/// utilisables depuis le fichier courant.
+pub(crate) fn imported_class_source<'a>(
+    workspace: &'a Workspace,
+    uri: &str,
+    document: &WorkspaceDocument,
+    class_name: &str,
+) -> Option<(String, &'a WorkspaceDocument)> {
+    let current_file = uri_to_path(uri)?;
+    let resolver = ModuleResolver::new(workspace.root().map(Path::to_path_buf));
+
+    for import in parse_import_bindings(&document.text) {
+        let Some(module_path) = resolver.resolve(&current_file, &import.parts) else {
+            continue;
+        };
+        let module_uri = path_to_uri(&module_path);
+        let Some(module) = workspace.get(&module_uri) else {
+            continue;
+        };
+        let exported = module
+            .symbols
+            .get(class_name)
+            .is_some_and(|symbol| symbol.is_exported);
+        if exported && module.classes.contains(class_name) {
+            return Some((module_uri, module));
+        }
+    }
+
+    None
+}
+
+fn imported_class_index<'a>(
+    workspace: &'a Workspace,
+    uri: &str,
+    document: &WorkspaceDocument,
+    class_name: &str,
+) -> Option<&'a ClassIndex> {
+    imported_class_source(workspace, uri, document, class_name).map(|(_, module)| &module.classes)
+}
+
+/// Document (et URI) qui définit `class_name` : le document courant, sinon
+/// un module importé qui l'exporte.
+pub(crate) fn class_source<'a>(
+    workspace: &'a Workspace,
+    uri: &str,
+    document: &'a WorkspaceDocument,
+    class_name: &str,
+) -> Option<(String, &'a WorkspaceDocument)> {
+    if document.classes.contains(class_name) {
+        return Some((uri.to_string(), document));
+    }
+    imported_class_source(workspace, uri, document, class_name)
+}
+
+/// Un membre `private`/`protected` n'est accessible que depuis la classe
+/// elle-même (`allow_private`, receveur `self`) ; tout le reste est `public`.
+pub(crate) fn member_is_accessible(
+    classes: &ClassIndex,
+    class_name: &str,
+    member: &str,
+    allow_private: bool,
+) -> bool {
+    if allow_private {
+        return true;
+    }
+    if let Some(field) = classes.field(class_name, member) {
+        return field.visibility == Visibility::Public;
+    }
+    if let Some(method) = classes.method(class_name, member) {
+        return method.visibility == Visibility::Public;
+    }
+    true
+}
+
+/// `allow_private` : le receveur est `self` (ou un chemin `self.…`), donc les
+/// membres `private`/`protected` de la classe sont accessibles.
 fn member_result_types(
     workspace: &Workspace,
     uri: &str,
     document: &WorkspaceDocument,
     ty: &Type,
     name: &str,
+    allow_private: bool,
 ) -> Vec<Type> {
     match ty {
         Type::Union(members) => members
             .iter()
-            .flat_map(|member| member_result_types(workspace, uri, document, member, name))
+            .flat_map(|member| {
+                member_result_types(workspace, uri, document, member, name, allow_private)
+            })
             .collect(),
         Type::Named(class_name) => {
-            if let Some(field) = document.classes.field(class_name, name) {
+            let classes = if document.classes.contains(class_name) {
+                &document.classes
+            } else if let Some(imported) =
+                imported_class_index(workspace, uri, document, class_name)
+            {
+                imported
+            } else {
+                return Vec::new();
+            };
+            if let Some(field) = classes.field(class_name, name) {
+                if field.visibility != Visibility::Public && !allow_private {
+                    return Vec::new();
+                }
                 if let Some(annotation) = &field.type_annotation {
                     return vec![Type::from_type_expr(annotation)];
                 }
             }
-            if let Some(method) = document.classes.method(class_name, name) {
+            if let Some(method) = classes.method(class_name, name) {
+                if method.visibility != Visibility::Public && !allow_private {
+                    return Vec::new();
+                }
                 return vec![Type::Function(method.function_type())];
             }
             Vec::new()
@@ -671,6 +792,14 @@ fn member_result_types(
             let Some(module) = workspace.get(&module_uri) else {
                 return Vec::new();
             };
+            // Un membre non exporté n'est pas accessible depuis l'extérieur.
+            if !module
+                .symbols
+                .get(name)
+                .is_some_and(|symbol| symbol.is_exported)
+            {
+                return Vec::new();
+            }
             module
                 .types
                 .get(name)
@@ -1314,5 +1443,64 @@ mod tests {
     fn list_is_current_container_name() {
         assert!(LIST_METHODS.iter().any(|(name, _, _)| *name == "add"));
         assert!(!LIST_METHODS.iter().any(|(name, _, _)| *name == "push"));
+    }
+
+    fn member_labels(source: &str, line: u32, character: u32) -> Vec<String> {
+        let mut workspace = Workspace::new();
+        workspace.open("file:///main.ks".to_string(), 1, source.to_string());
+        let result = build_completion(&workspace, "file:///main.ks", line, character)
+            .expect("complétion attendue");
+        let items = match &result {
+            Value::Array(items) => items.clone(),
+            other => other["items"].as_array().cloned().unwrap_or_default(),
+        };
+        items
+            .iter()
+            .filter_map(|item| item["label"].as_str().map(str::to_string))
+            .collect()
+    }
+
+    const PERSONE: &str = "class Persone {
+    private let nom: str;
+
+    func initialize(nom: str) {
+        self.nom = nom;
+    }
+
+    func get_nom() -> str {
+        return self.nom;
+    }
+
+    private func secret() { }
+}
+
+let p = new Persone(\"Gerrard\");
+p.
+";
+
+    #[test]
+    fn outside_the_class_only_public_members_are_completed() {
+        let labels = member_labels(PERSONE, 15, 2);
+
+        assert!(labels.iter().any(|l| l == "get_nom"), "{labels:?}");
+        assert!(!labels.iter().any(|l| l == "nom"), "{labels:?}");
+        assert!(!labels.iter().any(|l| l == "secret"), "{labels:?}");
+    }
+
+    #[test]
+    fn self_still_sees_private_members() {
+        let source = "class A {
+    private let nom: str;
+    private func secret() { }
+
+    func f() {
+        self.
+    }
+}
+";
+        let labels = member_labels(source, 5, 13);
+
+        assert!(labels.iter().any(|l| l == "nom"), "{labels:?}");
+        assert!(labels.iter().any(|l| l == "secret"), "{labels:?}");
     }
 }

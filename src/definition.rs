@@ -4,7 +4,10 @@ use kastel::compiler::types::Type;
 use kastel::frontend::ast::Statement;
 use serde_json::{Value, json};
 
-use crate::completion::{detect_member_access, infer_receiver_types, line_and_byte_to_offset};
+use crate::completion::{
+    class_source, detect_member_access, infer_receiver_types, line_and_byte_to_offset,
+    member_is_accessible,
+};
 use crate::lsp_position::offset_to_lsp;
 use crate::module_resolver::ModuleResolver;
 use crate::text_util::{find_word_at, utf16_character_to_byte_index};
@@ -51,6 +54,11 @@ pub fn build_definition(
         {
             return Some(result);
         }
+        // `obj.membre` privé, non exporté ou introuvable : ne pas retomber sur
+        // un symbole global qui porterait le même nom.
+        if !context.is_import_line {
+            return None;
+        }
     }
 
     // 2. Symbole local/courant : fonctions, classes, interfaces, types,
@@ -71,36 +79,21 @@ fn resolve_member_definition(
     member: &str,
     offset: usize,
 ) -> Option<Value> {
+    // `private`/`protected` : accessibles uniquement via `self`.
+    let allow_private = receiver == "self";
     let receiver_types = infer_receiver_types(workspace, uri, document, receiver, offset);
 
     for ty in receiver_types {
-        match ty {
-            Type::Named(class_name) => {
-                if let Some(result) = class_member_definition(document, uri, &class_name, member) {
-                    return Some(result);
-                }
-            }
-            Type::Module(path) => {
-                if let Some(result) = module_member_definition(workspace, uri, &path, member) {
-                    return Some(result);
-                }
-            }
-            Type::Union(members) => {
-                for member_ty in members {
-                    if let Some(result) = resolve_single_member_definition(
-                        workspace, uri, document, &member_ty, member,
-                    ) {
-                        return Some(result);
-                    }
-                }
-            }
-            _ => {}
+        if let Some(result) =
+            resolve_single_member_definition(workspace, uri, document, &ty, member, allow_private)
+        {
+            return Some(result);
         }
     }
 
     if receiver == "self" {
         if let Some(class_name) = find_enclosing_class(document, offset) {
-            return class_member_definition(document, uri, &class_name, member);
+            return class_member_definition(workspace, uri, document, &class_name, member, true);
         }
     }
 
@@ -113,33 +106,56 @@ fn resolve_single_member_definition(
     document: &WorkspaceDocument,
     ty: &Type,
     member: &str,
+    allow_private: bool,
 ) -> Option<Value> {
     match ty {
-        Type::Named(class_name) => class_member_definition(document, uri, class_name, member),
+        Type::Named(class_name)
+        | Type::Generic {
+            name: class_name, ..
+        } => class_member_definition(workspace, uri, document, class_name, member, allow_private),
         Type::Module(path) => module_member_definition(workspace, uri, path, member),
         Type::Union(members) => members.iter().find_map(|member_ty| {
-            resolve_single_member_definition(workspace, uri, document, member_ty, member)
+            resolve_single_member_definition(
+                workspace,
+                uri,
+                document,
+                member_ty,
+                member,
+                allow_private,
+            )
         }),
         _ => None,
     }
 }
 
+/// Définition d'un membre de classe. La classe peut venir d'un module importé
+/// (exportée uniquement) : la position retournée pointe alors dans ce module.
+/// Un membre `private`/`protected` n'est résolu que depuis `self`.
 fn class_member_definition(
-    document: &WorkspaceDocument,
+    workspace: &Workspace,
     uri: &str,
+    document: &WorkspaceDocument,
     class_name: &str,
     member: &str,
+    allow_private: bool,
 ) -> Option<Value> {
-    let owner = if document.classes.method(class_name, member).is_some() {
-        document.classes.method_owner(class_name, member)
-    } else if document.classes.field(class_name, member).is_some() {
-        find_field_owner(&document.classes, class_name, member)
+    let (class_uri, class_document) = class_source(workspace, uri, document, class_name)?;
+    let classes = &class_document.classes;
+
+    if !member_is_accessible(classes, class_name, member, allow_private) {
+        return None;
+    }
+
+    let owner = if classes.method(class_name, member).is_some() {
+        classes.method_owner(class_name, member)
+    } else if classes.field(class_name, member).is_some() {
+        find_field_owner(classes, class_name, member)
     } else {
         None
     }?;
 
-    let span = find_member_declaration_span(&document.text, &owner, member)?;
-    Some(location(uri, document, span.0, span.1))
+    let span = find_member_declaration_span(&class_document.text, &owner, member)?;
+    Some(location(&class_uri, class_document, span.0, span.1))
 }
 
 fn find_field_owner(
@@ -485,5 +501,52 @@ mod tests {
         let source = "interface Named {\n    func name() -> str;\n}\n";
         let span = find_member_declaration_span(source, "Named", "name").unwrap();
         assert_eq!(&source[span.0..span.1], "name");
+    }
+
+    const ACCESS_SOURCE: &str = "class Persone {
+    private let nom: str;
+
+    func get_nom() -> str {
+        return self.nom;
+    }
+}
+
+let p = new Persone(\"G\");
+let a = p.nom;
+let b = p.get_nom();
+";
+
+    fn access_workspace() -> Workspace {
+        let mut workspace = Workspace::new();
+        workspace.open(
+            "file:///main.ks".to_string(),
+            1,
+            ACCESS_SOURCE.to_string(),
+        );
+        workspace
+    }
+
+    #[test]
+    fn definition_hides_private_member_outside_the_class() {
+        let workspace = access_workspace();
+        assert!(build_definition(&workspace, "file:///main.ks", 9, 11).is_none());
+    }
+
+    #[test]
+    fn definition_finds_public_member_outside_the_class() {
+        let workspace = access_workspace();
+        let result = build_definition(&workspace, "file:///main.ks", 10, 12)
+            .expect("définition attendue");
+        // Déclaration `func get_nom` : ligne 3 (0-based).
+        assert_eq!(result["range"]["start"]["line"], 3);
+    }
+
+    #[test]
+    fn definition_finds_private_member_through_self() {
+        let workspace = access_workspace();
+        let result = build_definition(&workspace, "file:///main.ks", 4, 21)
+            .expect("définition attendue");
+        // Déclaration `private let nom` : ligne 1 (0-based).
+        assert_eq!(result["range"]["start"]["line"], 1);
     }
 }

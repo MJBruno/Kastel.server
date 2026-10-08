@@ -2,7 +2,10 @@ use kastel::compiler::types::Type;
 use serde_json::{Value, json};
 
 use crate::class_index::MethodInfo;
-use crate::completion::{detect_member_access, line_and_byte_to_offset, line_text_at};
+use crate::completion::{
+    class_source, detect_member_access, line_and_byte_to_offset, line_text_at,
+    member_is_accessible,
+};
 use crate::language::{
     BUILTIN_FUNCTIONS, member_table,
 };
@@ -32,6 +35,11 @@ pub fn build_hover(workspace: &Workspace, uri: &str, line: u32, character: u32) 
             &range,
         ) {
             return Some(value);
+        }
+        // `obj.membre` introuvable ou inaccessible (privé, non exporté) :
+        // ne pas retomber sur un symbole global qui porterait le même nom.
+        if !context.is_import_line {
+            return None;
         }
     }
 
@@ -176,7 +184,7 @@ fn build_workspace_symbol_hover(
         let Some(module) = workspace.get(&module_uri) else {
             continue;
         };
-        if let Some(symbol) = module.symbols.get(word) {
+        if let Some(symbol) = module.symbols.get(word).filter(|symbol| symbol.is_exported) {
             let ty = module
                 .types
                 .get(word)
@@ -213,8 +221,19 @@ fn build_member_hover(
     let offset = line_and_byte_to_offset(&document.text, line, word_start);
     let receiver_types = infer_receiver_types(workspace, uri, document, receiver, offset);
 
+    // `private`/`protected` : visibles uniquement via `self`.
+    let allow_private = receiver == "self";
+
     for ty in receiver_types {
-        if let Some(value) = hover_for_type_member(workspace, uri, document, &ty, member, range) {
+        if let Some(value) = hover_for_type_member(
+            workspace,
+            uri,
+            document,
+            &ty,
+            member,
+            allow_private,
+            range,
+        ) {
             return Some(value);
         }
     }
@@ -244,6 +263,8 @@ fn infer_receiver_types(
         .map(|ty| vec![ty])
         .unwrap_or_default();
 
+    let allow_private = receiver.split('.').next() == Some("self");
+
     for segment in receiver.split('.').skip(1) {
         let mut next = Vec::new();
         for ty in current {
@@ -251,7 +272,14 @@ fn infer_receiver_types(
             {
                 next.extend(module_types);
             } else {
-                next.extend(type_member_type(document, &ty, segment));
+                next.extend(type_member_type(
+                    workspace,
+                    uri,
+                    document,
+                    &ty,
+                    segment,
+                    allow_private,
+                ));
             }
         }
         current = next;
@@ -266,6 +294,7 @@ fn hover_for_type_member(
     document: &WorkspaceDocument,
     ty: &Type,
     member: &str,
+    allow_private: bool,
     range: &Value,
 ) -> Option<Value> {
     match ty {
@@ -278,6 +307,7 @@ fn hover_for_type_member(
                     document,
                     member_ty,
                     member,
+                    allow_private,
                     range,
                 ) {
                     if let Some(text) = hover
@@ -298,9 +328,14 @@ fn hover_for_type_member(
         Type::Named(class_name)
         | Type::Generic {
             name: class_name, ..
-        } if document.classes.contains(class_name) => {
-            if let Some(field) = document.classes.field(class_name, member) {
-                if document.classes.is_enum(class_name) {
+        } if class_source(workspace, current_uri, document, class_name).is_some() => {
+            let (_, class_document) = class_source(workspace, current_uri, document, class_name)?;
+            let classes = &class_document.classes;
+            if !member_is_accessible(classes, class_name, member, allow_private) {
+                return None;
+            }
+            if let Some(field) = classes.field(class_name, member) {
+                if classes.is_enum(class_name) {
                     return Some(hover_value(
                         format!(
                             "```kastel\n{}.{}\n```\n\nVariant of enum `{}`",
@@ -326,7 +361,7 @@ fn hover_for_type_member(
                     range.clone(),
                 ));
             }
-            if let Some(method) = document.classes.method(class_name, member) {
+            if let Some(method) = classes.method(class_name, member) {
                 let visibility = match method.visibility {
                     kastel::frontend::ast::Visibility::Private => "private",
                     kastel::frontend::ast::Visibility::Protected => "protected",
@@ -417,17 +452,40 @@ fn module_member_types(
     let module_path = resolver.resolve(&current_file, &parts)?;
     let module_uri = crate::uri_util::path_to_uri(&module_path);
     let module = workspace.get(&module_uri)?;
+    // Un membre non exporté n'est pas accessible depuis l'extérieur.
+    if !module
+        .symbols
+        .get(segment)
+        .is_some_and(|symbol| symbol.is_exported)
+    {
+        return Some(Vec::new());
+    }
     module.types.get(segment).cloned().map(|ty| vec![ty])
 }
 
-fn type_member_type(document: &WorkspaceDocument, ty: &Type, name: &str) -> Vec<Type> {
+fn type_member_type(
+    workspace: &Workspace,
+    uri: &str,
+    document: &WorkspaceDocument,
+    ty: &Type,
+    name: &str,
+    allow_private: bool,
+) -> Vec<Type> {
     match ty {
         Type::Union(members) => members
             .iter()
-            .flat_map(|t| type_member_type(document, t, name))
+            .flat_map(|t| type_member_type(workspace, uri, document, t, name, allow_private))
             .collect(),
         Type::Named(class_name) => {
-            if let Some(field) = document.classes.field(class_name, name) {
+            let Some((_, class_document)) = class_source(workspace, uri, document, class_name)
+            else {
+                return Vec::new();
+            };
+            let classes = &class_document.classes;
+            if !member_is_accessible(classes, class_name, name, allow_private) {
+                return Vec::new();
+            }
+            if let Some(field) = classes.field(class_name, name) {
                 vec![
                     field
                         .type_annotation
@@ -435,7 +493,7 @@ fn type_member_type(document: &WorkspaceDocument, ty: &Type, name: &str) -> Vec<
                         .map(Type::from_type_expr)
                         .unwrap_or(Type::Dynamic),
                 ]
-            } else if let Some(method) = document.classes.method(class_name, name) {
+            } else if let Some(method) = classes.method(class_name, name) {
                 vec![Type::Function(method.function_type())]
             } else {
                 Vec::new()
@@ -582,5 +640,49 @@ mod tests {
                 .iter()
                 .all(|(name, ..)| *name != "push" && *name != "length")
         );
+    }
+
+    const ACCESS_SOURCE: &str = "class Persone {
+    private let nom: str;
+
+    func get_nom() -> str {
+        return self.nom;
+    }
+}
+
+let p = new Persone(\"G\");
+let a = p.nom;
+let b = p.get_nom();
+";
+
+    fn access_workspace() -> Workspace {
+        let mut workspace = Workspace::new();
+        workspace.open(
+            "file:///main.ks".to_string(),
+            1,
+            ACCESS_SOURCE.to_string(),
+        );
+        workspace
+    }
+
+    #[test]
+    fn hover_hides_private_member_outside_the_class() {
+        let workspace = access_workspace();
+        // `p.nom` : champ privé, pas de survol depuis l'extérieur.
+        assert!(build_hover(&workspace, "file:///main.ks", 9, 11).is_none());
+    }
+
+    #[test]
+    fn hover_shows_public_member_outside_the_class() {
+        let workspace = access_workspace();
+        let hover = build_hover(&workspace, "file:///main.ks", 10, 12).expect("survol attendu");
+        assert!(hover.to_string().contains("get_nom"));
+    }
+
+    #[test]
+    fn hover_shows_private_member_through_self() {
+        let workspace = access_workspace();
+        let hover = build_hover(&workspace, "file:///main.ks", 4, 21).expect("survol attendu");
+        assert!(hover.to_string().contains("nom"));
     }
 }
